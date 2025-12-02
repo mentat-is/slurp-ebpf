@@ -1,0 +1,9 @@
+{
+  "gulp": {
+    "uri": "http://localhost:8080",
+    "username": "ingest",
+    "password": "ingest"
+  },
+  "chunk_size": 1000,
+  "hooks": []
+}
