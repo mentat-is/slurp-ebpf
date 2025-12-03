@@ -27,3 +27,4 @@ if [ "$(id -u)" -ne 0 ]; then
 else
   ./slurp $ARGS
 fi
+
