@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/gorilla/websocket"
 )
 
 // JSendResponse models the login response from Gulp.
@@ -58,6 +60,34 @@ type GulpWsAcknowledgedPacket struct {
 	WsID  string `json:"ws_id"`
 	ReqID string `json:"req_id"`
 	Token string `json:"token"`
+}
+
+// waitConnectionAck runs a continuous reader loop and reports any final error.
+func waitConnectionAck(conn *websocket.Conn, ackCh chan<- GulpWsAcknowledgedPacket, errCh chan<- error) {
+	for {
+		_, m, err := conn.ReadMessage()
+		if err != nil {
+			// report final error and exit
+			select {
+			case errCh <- err:
+			default:
+			}
+			return
+		}
+		var d GulpWsData
+		if err := json.Unmarshal(m, &d); err != nil {
+			continue
+		}
+		dbg("received ws message type=%s payload_len=%d", d.Type, len(d.Payload))
+		if d.Type == "ws_connected" {
+			var a GulpWsAcknowledgedPacket
+			if err := json.Unmarshal(d.Payload, &a); err == nil {
+				// deliver the handshake ack and exit the reader
+				ackCh <- a
+				return
+			}
+		}
+	}
 }
 
 // login authenticates to the Gulp HTTP API using the login endpoint and returns a token.

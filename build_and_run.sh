@@ -5,14 +5,14 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
 echo "[slurp-ebpf] Building BPF object..."
-if [ -x "./bpf/build_bpf.sh" ]; then
-  (cd bpf && ./build_bpf.sh)
+if [ -x "./ebpf/build_ebpf.sh" ]; then
+  (cd ebpf && ./build_ebpf.sh)
 else
-  ./bpf/build_bpf.sh
+  ./ebpf/build_ebpf.sh
 fi
 
 echo "[slurp-ebpf] Building Go binary..."
-go build -o slurp
+go build -o slurp-ebpf ./cmd/slurp-ebpf
 
 echo "[slurp-ebpf] Ready to run. Note: loading BPF objects requires root privileges."
 if [ "$#" -gt 0 ]; then
@@ -22,8 +22,8 @@ else
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "[slurp-ebpf] Not running as root; using sudo to execute slurp. You may be prompted for a password."
-  sudo ./slurp $ARGS
+  echo "[slurp-ebpf] Not running as root; using sudo to execute slurp-ebpf. You may be prompted for a password."
+  sudo ./slurp-ebpf $ARGS
 else
   ./slurp $ARGS
 fi

@@ -17,9 +17,10 @@ type Config struct {
 
 // GulpConfig contains credentials and URI for Gulp.
 type GulpConfig struct {
-	URI      string `json:"uri"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	URI         string `json:"uri"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	OperationID string `json:"operation_id"`
 }
 
 // loadConfig reads the JSON file at path and returns a Config with defaults.
