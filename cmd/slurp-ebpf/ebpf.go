@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"golang.org/x/sys/unix"
 )
 
 // ebpfSetup loads the BPF collection, attaches programs declared in cfg.Hooks
@@ -157,7 +159,7 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 }
 
 // sendPacket writes the ingest metadata then the binary JSON chunk.
-func sendPacket(conn *websocket.Conn, cfg *Config, wsID, reqID string, chunk *[]Event, last bool) error {
+func sendPacket(ws *WSClient, cfg *Config, wsID, reqID string, chunk *[]Event, last bool) error {
 	if len(*chunk) == 0 && !last {
 		return nil
 	}
@@ -170,19 +172,23 @@ func sendPacket(conn *websocket.Conn, cfg *Config, wsID, reqID string, chunk *[]
 		Last:        last,
 	}
 	pj, _ := json.Marshal(p)
-	if err := conn.WriteMessage(websocket.TextMessage, pj); err != nil {
+	// queue text metadata; if queue full drop and continue
+	if err := ws.SendRaw(websocket.TextMessage, pj); err != nil {
+		dbg("sendPacket: queued text packet failed: %v", err)
+		// if client closed, return error to stop reader
 		return err
 	}
 	raw, _ := json.Marshal(*chunk)
-	if err := conn.WriteMessage(websocket.BinaryMessage, raw); err != nil {
+	if err := ws.SendRaw(websocket.BinaryMessage, raw); err != nil {
+		dbg("sendPacket: queued binary packet failed: %v", err)
 		return err
 	}
 	*chunk = (*chunk)[:0]
 	return nil
 }
 
-// ebpfEventReader reads events, batches up to cfg.ChunkSize, and sends them inline.
-func ebpfEventReader(ctx context.Context, bpfPath string, conn *websocket.Conn, cfg *Config, wsID, reqID string) error {
+// ebpfEventReader reads events, batches up to cfg.MaxChunkSize, and sends them inline.
+func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Config, wsID, reqID string) error {
 	reader, cleanup, err := ebpfSetup(bpfPath, cfg)
 	if err != nil {
 		return err
@@ -190,29 +196,38 @@ func ebpfEventReader(ctx context.Context, bpfPath string, conn *websocket.Conn, 
 	defer cleanup()
 
 	contextID, sourceID := buildContextIDs()
-	chunk := make([]Event, 0, cfg.ChunkSize)
+	// use configured max chunk size as capacity for buffered events
+	chunk := make([]Event, 0, cfg.MaxChunkSize)
+
+	// ticker to flush events every 15 seconds
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	// spawn a reader goroutine to convert the blocking Read() into channel events
+	recCh := make(chan ringbuf.Record)
+	readErrCh := make(chan error, 1)
+	go func() {
+		for {
+			rec, err := reader.Read()
+			if err != nil {
+				// non-blocking send of error; allow main loop to handle sleep/retry
+				select {
+				case readErrCh <- err:
+				default:
+				}
+				continue
+			}
+			recCh <- rec
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			_ = sendPacket(conn, cfg, wsID, reqID, &chunk, true)
+			_ = sendPacket(ws, cfg, wsID, reqID, &chunk, true)
 			return nil
-		default:
-		}
-
-		rec, err := reader.Read()
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				_ = sendPacket(conn, cfg, wsID, reqID, &chunk, true)
-				return nil
-			default:
-			}
-			continue
-		}
-
-		raw := rec.RawSample
+		case rec := <-recCh:
+			raw := rec.RawSample
 		var tsMs uint64
 		var pid uint32
 		var tgid uint32
@@ -256,19 +271,75 @@ func ebpfEventReader(ctx context.Context, bpfPath string, conn *websocket.Conn, 
 
 		seq := atomic.AddUint64(&globalSeq, 1)
 		id := strings.ReplaceAll(uuid.NewString(), "-", "")
-		ts := time.UnixMilli(int64(tsMs)).UTC().Format(time.RFC3339)
-		gulpTs := int64(tsMs) * 1_000_000
+		// convert bpf monotonic ms to wall-clock time
+		evtNs := int64(tsMs) * 1_000_000
+		wallT, wallNs := monotonicNsToWallTime(evtNs)
+		ts := wallT.Format(time.RFC3339)
+		gulpTs := wallNs
 
 		evtAction := "unknown"
 		switch evtType {
 		case 1:
 			evtAction = "execve"
 		case 2:
-			evtAction = "openat_enter"
+			evtAction = "connect_enter"
 		case 3:
-			evtAction = "openat_exit"
-		case 4:
-			evtAction = "do_sys_open_kprobe"
+			evtAction = "accept_exit"
+		}
+
+		// attempt to parse optional network fields appended after filename
+		// layout in C: after filename (offset 44 + 256 == 300) =>
+		// family(2), sport(2), dport(2), saddr(4), daddr(4), saddr6(16), daddr6(16)
+		var netInfo map[string]interface{}
+		netBase := 44 + 256
+		if len(raw) >= netBase+14 {
+			family := binary.LittleEndian.Uint16(raw[netBase : netBase+2])
+			sport := binary.LittleEndian.Uint16(raw[netBase+2 : netBase+4])
+			dport := binary.LittleEndian.Uint16(raw[netBase+4 : netBase+6])
+
+			// ipv4 addresses are stored starting at netBase+6 (4 bytes each)
+			var saddrStr, daddrStr string
+			if len(raw) >= netBase+14 {
+				saddrBytes := raw[netBase+6 : netBase+10]
+				daddrBytes := raw[netBase+10 : netBase+14]
+				// bytes are copied as network-order bytes; format as dotted quad
+				saddrStr = fmt.Sprintf("%d.%d.%d.%d", saddrBytes[0], saddrBytes[1], saddrBytes[2], saddrBytes[3])
+				daddrStr = fmt.Sprintf("%d.%d.%d.%d", daddrBytes[0], daddrBytes[1], daddrBytes[2], daddrBytes[3])
+			}
+
+			// if ipv6 addresses present, parse into string form
+			var saddr6Str, daddr6Str string
+			if len(raw) >= netBase+14+16+16 {
+				saddr6 := raw[netBase+14 : netBase+30]
+				daddr6 := raw[netBase+30 : netBase+46]
+				saddr6Str = net.IP(saddr6).String()
+				daddr6Str = net.IP(daddr6).String()
+			}
+
+			// attach network info to event map when present
+			if family != 0 {
+				netInfo = map[string]interface{}{
+					"network.family": int(family),
+				}
+				if saddrStr != "" {
+					netInfo["network.saddr"] = saddrStr
+				}
+				if daddrStr != "" {
+					netInfo["network.daddr"] = daddrStr
+				}
+				if saddr6Str != "" {
+					netInfo["network.saddr6"] = saddr6Str
+				}
+				if daddr6Str != "" {
+					netInfo["network.daddr6"] = daddr6Str
+				}
+				if sport != 0 {
+					netInfo["network.sport"] = int(sport)
+				}
+				if dport != 0 {
+					netInfo["network.dport"] = int(dport)
+				}
+			}
 		}
 
 		e := Event{
@@ -297,18 +368,61 @@ func ebpfEventReader(ctx context.Context, bpfPath string, conn *websocket.Conn, 
 			"ebpf.filename":          filename,
 		}
 
-		chunk = append(chunk, e)
-		if len(chunk) >= cfg.ChunkSize {
-			if err := sendPacket(conn, cfg, wsID, reqID, &chunk, false); err != nil {
-				return err
+		// merge any parsed network info into the event
+		if netInfo != nil {
+			for k, v := range netInfo {
+				e[k] = v
+			}
+		}
+
+			dbg("ebpf event: ts=%s(tsMs=%d, gulpTs=%d) pid=%d tgid=%d uid=%d gid=%d evt_type=%d comm=%s filename=%s", ts, tsMs, gulpTs, pid, tgid, uid, gid, evtType, comm, filename)
+			chunk = append(chunk, e)
+			if len(chunk) >= cfg.MaxChunkSize {
+				if err := sendPacket(ws, cfg, wsID, reqID, &chunk, false); err != nil {
+					return err
+				}
+			}
+		case err := <-readErrCh:
+			// transient read error; wait briefly then continue. if context cancelled, exit.
+			_ = err
+			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				_ = sendPacket(ws, cfg, wsID, reqID, &chunk, true)
+				return nil
+			default:
+			}
+		case <-ticker.C:
+			if len(chunk) > 0 {
+				if err := sendPacket(ws, cfg, wsID, reqID, &chunk, false); err != nil {
+					return err
+				}
 			}
 		}
 	}
 }
 
+// monotonicNsToWallTime converts a monotonic timestamp (nanoseconds since
+// boot, as produced by bpf_ktime_get_ns) to a wall-clock time.Time and the
+// corresponding unix-nanoseconds value. It uses CLOCK_MONOTONIC to compute
+// the system boot epoch and falls back to treating the input as unix time
+// when CLOCK_MONOTONIC is unavailable.
+func monotonicNsToWallTime(evtNs int64) (time.Time, int64) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err == nil {
+		monoNow := ts.Sec*1e9 + int64(ts.Nsec)
+		wallNow := time.Now().UnixNano()
+		bootEpoch := wallNow - monoNow
+		eventWallNs := bootEpoch + evtNs
+		return time.Unix(0, eventWallNs).UTC(), eventWallNs
+	}
+	// fallback: treat evtNs as unix-ns (best-effort)
+	return time.Unix(0, evtNs).UTC(), evtNs
+}
+
 // readEbpfEvents is a small wrapper used by the caller to start the reader.
-func readEbpfEvents(ctx context.Context, bpfPath string, conn *websocket.Conn, cfg *Config, wsID, reqID string, errCh chan<- error) {
-	err := ebpfEventReader(ctx, bpfPath, conn, cfg, wsID, reqID)
+func readEbpfEvents(ctx context.Context, bpfPath string, ws *WSClient, cfg *Config, wsID, reqID string, errCh chan<- error) {
+	err := ebpfEventReader(ctx, bpfPath, ws, cfg, wsID, reqID)
 	select {
 	case errCh <- err:
 	default:

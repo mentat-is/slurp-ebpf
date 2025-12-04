@@ -5,6 +5,6 @@
     "password": "ingest",
     "operation_id": "test_operation"
   },
-  "chunk_size": 1000,
+  "max_chunk_size": 1000,
   "hooks": []
 }

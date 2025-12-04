@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -68,7 +69,7 @@ func main() {
 
 	// if hooks empty, add defaults
 	if len(cfg.Hooks) == 0 {
-		cfg.Hooks = []string{"sys_enter_execve", "sys_exit_open", "kprobe__do_sys_open"}
+		cfg.Hooks = []string{"tracepoint/syscalls/sys_enter_execve", "tracepoint/syscalls/sys_enter_connect", "tracepoint/syscalls/sys_exit_accept"}
 	}
 	dbg("hooks: %v", cfg.Hooks)
 
@@ -80,30 +81,57 @@ func main() {
 	}
 	dbg("login successful, token length=%d", len(token))
 
-	wsURL, err := wsURLFromURI(cfg.Gulp.URI)
+	// websocket URL and TLS decision are determined below
+
+	// build tls config from gulp settings (may be nil)
+	// decide whether to use TLS: only use TLS when the gulp URI is https or
+	// when certificates/options are provided in the config. otherwise use plain ws/http.
+	useTLS := shouldUseTLS(cfg.Gulp)
+	var wsURL string
+	wsURL, err = wsURLFromURI(cfg.Gulp.URI, useTLS)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid gulp uri: %v\n", err)
 		os.Exit(2)
 	}
 	dbg("ws url resolved: %s", wsURL)
 
+	// build tls config only if TLS is requested
+	var tlsCfg *tls.Config
+	if useTLS {
+		tlsCfg, err = tlsConfigFromGulp(cfg.Gulp)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build TLS config: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	// connect to websocket
-	dialer := websocket.Dialer{}
+	dialer := websocket.Dialer{TLSClientConfig: tlsCfg}
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "websocket dial error: %v\n", err)
 		os.Exit(2)
 	}
-	defer conn.Close()
 	dbg("websocket connection established")
 
+	// set a pong handler and read deadline so pongs extend the read deadline
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// create a writer helper with a bounded queue and a periodic ping
+	ws := NewWSClient(conn, 1024, 25*time.Second)
+
+	// send auth via the async writer
 	auth := GulpWsAuthPacket{Token: token}
 	aj, _ := json.Marshal(auth)
-	if err := conn.WriteMessage(websocket.TextMessage, aj); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to send auth: %v\n", err)
+	if err := ws.SendRaw(websocket.TextMessage, aj); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to queue auth: %v\n", err)
 		os.Exit(2)
 	}
-	dbg("sent auth packet to websocket")
+	dbg("queued auth packet to websocket")
 
 	// read loop to wait for websocket acknowledgement (GulpWsAcknowledgedPacket in payload)
 	ackCh := make(chan GulpWsAcknowledgedPacket, 1)
@@ -131,7 +159,7 @@ func main() {
 	prodCtx, prodCancel := context.WithCancel(ctx)
 	bpfPath := cfg.BpfObject
 	if bpfPath == "" {
-		bpfPath = "./slurp_bpf.o"
+		bpfPath = "./slurp_ebpf.o"
 	}
 	if _, err := os.Stat(bpfPath); err != nil {
 		fmt.Fprintf(os.Stderr, "bpf object not found: %s\n", bpfPath)
@@ -139,7 +167,7 @@ func main() {
 	}
 	ebpfErrCh := make(chan error, 1)
 	dbg("starting ebpf reader with object: %s", bpfPath)
-	go readEbpfEvents(prodCtx, bpfPath, conn, cfg, wsID, reqID, ebpfErrCh)
+	go readEbpfEvents(prodCtx, bpfPath, ws, cfg, wsID, reqID, ebpfErrCh)
 
 	select {
 	case err := <-ebpfErrCh:
@@ -149,13 +177,15 @@ func main() {
 		}
 	case <-time.After(300 * time.Millisecond):
 		// assume ebpf reader is running
+		dbg("300ms passed")
 	}
 
 	// wait for termination or error
 	select {
 	case <-ctx.Done():
+		dbg("ctx Done, canceling...")
 		prodCancel()
-		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		_ = ws.Close()
 	case err := <-ebpfErrCh:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: ebpf reader failed: %v\n", err)

@@ -18,7 +18,7 @@ echo "[slurp-ebpf] Ready to run. Note: loading BPF objects requires root privile
 if [ "$#" -gt 0 ]; then
   ARGS="$@"
 else
-  ARGS="-config slurp_cfg.json"
+  ARGS="--config slurp_cfg.json"
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
