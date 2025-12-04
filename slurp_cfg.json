@@ -1,8 +1,8 @@
 {
   "gulp": {
     "uri": "http://localhost:8080",
-    "username": "ingest",
-    "password": "ingest",
+    "username": "admin",
+    "password": "admin",
     "operation_id": "test_operation"
   },
   "max_chunk_size": 1000,

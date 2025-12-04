@@ -59,7 +59,6 @@ sequenceDiagram
   WS-->>Buffer: ack/control messages
 ```
 
-
 **Prerequisites**
 
 - Linux with eBPF support (kernel >= 4.19 recommended)
@@ -99,7 +98,8 @@ example `slurp_cfg.json` (the repo includes a sample):
     "operation_id": "test_operation"
   },
   "max_chunk_size": 1000,
-  "hooks": ["sys_enter_execve"]
+  "hooks": ["sys_enter_execve"],
+  "process_exclude": ["*/systemd*", "/usr/bin/some_noisy_app"]
 }
 ```
 
@@ -110,9 +110,13 @@ example `slurp_cfg.json` (the repo includes a sample):
 - `hooks`: list of hooks (tracepoint short-names or full sections) to attach, supported hooks:
     - `sys_enter_execve` : traces process execve calls (process creation)
     - `sys_enter_connect` : traces socket connect calls (outgoing connections)
-    - `sys_enter_accept` : traces socket accept calls (incoming connections)
+    - `sys_enter_accept` + `sys_exit_accept` : traces socket accept calls (incoming connections, both hooks are required)
   
 - `bpf_object` (optional): path to the compiled eBPF object; defaults to `./slurp_ebpf.o`
+- `process_exclude` (optional): list of patterns to exclude events by `process.name`. supports wildcards:
+    - `*` matches any sequence of characters
+    - `?` matches a single character
+    - example: `["/usr/bin/some_noisy_app", "*/systemd*"]`
 
 TLS / Client certificates
 

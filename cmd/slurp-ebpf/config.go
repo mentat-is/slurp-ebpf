@@ -14,6 +14,8 @@ type Config struct {
 	MaxChunkSize int      `json:"max_chunk_size"`
 	Hooks        []string `json:"hooks"`
 	BpfObject    string   `json:"bpf_object,omitempty"`
+	// process_exclude: list of patterns to exclude events by process.executable (wildcards supported)
+	ProcessExclude []string `json:"process_exclude,omitempty"`
 }
 
 // GulpConfig contains credentials and URI for Gulp.

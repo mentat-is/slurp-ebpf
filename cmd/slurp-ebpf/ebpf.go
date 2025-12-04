@@ -4,10 +4,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,10 +20,61 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"golang.org/x/sys/unix"
 )
+
+// matchPattern checks if s matches pattern with wildcard support.
+// supports * (matches any sequence) and ? (matches single character).
+func matchPattern(pattern, s string) bool {
+	return matchPatternHelper(pattern, s)
+}
+
+// matchPatternHelper is a recursive helper for glob-style pattern matching.
+func matchPatternHelper(pattern, s string) bool {
+	for len(pattern) > 0 {
+		switch pattern[0] {
+		case '*':
+			// skip consecutive stars
+			for len(pattern) > 0 && pattern[0] == '*' {
+				pattern = pattern[1:]
+			}
+			if len(pattern) == 0 {
+				return true
+			}
+			// try matching remainder at each position
+			for i := 0; i <= len(s); i++ {
+				if matchPatternHelper(pattern, s[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if len(s) == 0 {
+				return false
+			}
+			pattern = pattern[1:]
+			s = s[1:]
+		default:
+			if len(s) == 0 || pattern[0] != s[0] {
+				return false
+			}
+			pattern = pattern[1:]
+			s = s[1:]
+		}
+	}
+	return len(s) == 0
+}
+
+// shouldExcludeProcess checks if the executable matches any exclusion pattern.
+func shouldExcludeProcess(executable string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matchPattern(pattern, executable) {
+			return true
+		}
+	}
+	return false
+}
 
 // ebpfSetup loads the BPF collection, attaches programs declared in cfg.Hooks
 // and returns a ringbuf.Reader plus a cleanup function the caller must invoke.
@@ -199,6 +255,13 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 	// use configured max chunk size as capacity for buffered events
 	chunk := make([]Event, 0, cfg.MaxChunkSize)
 
+	// simple cache for process info to avoid hitting /proc for every event
+	type procInfo struct {
+		name    string
+		cmdline string
+	}
+	procCache := make(map[uint32]procInfo)
+
 	// ticker to flush events every 15 seconds
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -228,154 +291,286 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			return nil
 		case rec := <-recCh:
 			raw := rec.RawSample
-		var tsMs uint64
-		var pid uint32
-		var tgid uint32
-		var uid uint32
-		var gid uint32
-		var evtType uint32
-		var comm string
-		var filename string
-		if len(raw) >= 8 {
-			tsMs = binary.LittleEndian.Uint64(raw[0:8])
-		}
-		if len(raw) >= 16 {
-			pid = binary.LittleEndian.Uint32(raw[8:12])
-			tgid = binary.LittleEndian.Uint32(raw[12:16])
-		}
-		if len(raw) >= 28 {
-			uid = binary.LittleEndian.Uint32(raw[16:20])
-			gid = binary.LittleEndian.Uint32(raw[20:24])
-			evtType = binary.LittleEndian.Uint32(raw[24:28])
-		}
-		if len(raw) >= 44 {
-			commBytes := raw[28:44]
-			if i := bytes.IndexByte(commBytes, 0); i >= 0 {
-				comm = string(commBytes[:i])
-			} else {
-				comm = string(commBytes)
+			var tsMs uint64
+			var pid uint32
+			var tgid uint32
+			var uid uint32
+			var gid uint32
+			var evtType uint32
+			var comm string
+			var filename string
+			if len(raw) >= 8 {
+				tsMs = binary.LittleEndian.Uint64(raw[0:8])
 			}
-		}
-		if len(raw) >= 44+1 {
-			end := 44 + 256
-			if end > len(raw) {
-				end = len(raw)
+			if len(raw) >= 16 {
+				pid = binary.LittleEndian.Uint32(raw[8:12])
+				tgid = binary.LittleEndian.Uint32(raw[12:16])
 			}
-			fnameBytes := raw[44:end]
-			if i := bytes.IndexByte(fnameBytes, 0); i >= 0 {
-				filename = string(fnameBytes[:i])
-			} else {
-				filename = string(fnameBytes)
+			if len(raw) >= 28 {
+				uid = binary.LittleEndian.Uint32(raw[16:20])
+				gid = binary.LittleEndian.Uint32(raw[20:24])
+				evtType = binary.LittleEndian.Uint32(raw[24:28])
 			}
-		}
-
-		seq := atomic.AddUint64(&globalSeq, 1)
-		id := strings.ReplaceAll(uuid.NewString(), "-", "")
-		// convert bpf monotonic ms to wall-clock time
-		evtNs := int64(tsMs) * 1_000_000
-		wallT, wallNs := monotonicNsToWallTime(evtNs)
-		ts := wallT.Format(time.RFC3339)
-		gulpTs := wallNs
-
-		evtAction := "unknown"
-		switch evtType {
-		case 1:
-			evtAction = "execve"
-		case 2:
-			evtAction = "connect_enter"
-		case 3:
-			evtAction = "accept_exit"
-		}
-
-		// attempt to parse optional network fields appended after filename
-		// layout in C: after filename (offset 44 + 256 == 300) =>
-		// family(2), sport(2), dport(2), saddr(4), daddr(4), saddr6(16), daddr6(16)
-		var netInfo map[string]interface{}
-		netBase := 44 + 256
-		if len(raw) >= netBase+14 {
-			family := binary.LittleEndian.Uint16(raw[netBase : netBase+2])
-			sport := binary.LittleEndian.Uint16(raw[netBase+2 : netBase+4])
-			dport := binary.LittleEndian.Uint16(raw[netBase+4 : netBase+6])
-
-			// ipv4 addresses are stored starting at netBase+6 (4 bytes each)
-			var saddrStr, daddrStr string
-			if len(raw) >= netBase+14 {
-				saddrBytes := raw[netBase+6 : netBase+10]
-				daddrBytes := raw[netBase+10 : netBase+14]
-				// bytes are copied as network-order bytes; format as dotted quad
-				saddrStr = fmt.Sprintf("%d.%d.%d.%d", saddrBytes[0], saddrBytes[1], saddrBytes[2], saddrBytes[3])
-				daddrStr = fmt.Sprintf("%d.%d.%d.%d", daddrBytes[0], daddrBytes[1], daddrBytes[2], daddrBytes[3])
-			}
-
-			// if ipv6 addresses present, parse into string form
-			var saddr6Str, daddr6Str string
-			if len(raw) >= netBase+14+16+16 {
-				saddr6 := raw[netBase+14 : netBase+30]
-				daddr6 := raw[netBase+30 : netBase+46]
-				saddr6Str = net.IP(saddr6).String()
-				daddr6Str = net.IP(daddr6).String()
-			}
-
-			// attach network info to event map when present
-			if family != 0 {
-				netInfo = map[string]interface{}{
-					"network.family": int(family),
-				}
-				if saddrStr != "" {
-					netInfo["network.saddr"] = saddrStr
-				}
-				if daddrStr != "" {
-					netInfo["network.daddr"] = daddrStr
-				}
-				if saddr6Str != "" {
-					netInfo["network.saddr6"] = saddr6Str
-				}
-				if daddr6Str != "" {
-					netInfo["network.daddr6"] = daddr6Str
-				}
-				if sport != 0 {
-					netInfo["network.sport"] = int(sport)
-				}
-				if dport != 0 {
-					netInfo["network.dport"] = int(dport)
+			if len(raw) >= 44 {
+				commBytes := raw[28:44]
+				if i := bytes.IndexByte(commBytes, 0); i >= 0 {
+					comm = string(commBytes[:i])
+				} else {
+					comm = string(commBytes)
 				}
 			}
-		}
-
-		e := Event{
-			"_id":                    id,
-			"@timestamp":             ts,
-			"gulp.timestamp":         gulpTs,
-			"gulp.timestamp_invalid": false,
-			"gulp.operation_id":      "test_operation",
-			"gulp.context_id":        contextID,
-			"gulp.source_id":         sourceID,
-			"agent.type":             "ebpf",
-			"event.original":         fmt.Sprintf("comm=%s pid=%d tgid=%d uid=%d gid=%d filename=%s", comm, pid, tgid, uid, gid, filename),
-			"event.sequence":         int(seq),
-			"event.code":             "0",
-			"gulp.event_code":        0,
-			"event.duration":         1,
-			"process.name":           comm,
-			"process.pid":            pid,
-			"process.executable":     comm,
-			"user.uid":               int(uid),
-			"user.gid":               int(gid),
-			"event.action":           evtAction,
-			"host.hostname":          osHostnameOrEmpty(),
-			"file.path":              filename,
-			"file.name":              filename,
-			"ebpf.filename":          filename,
-		}
-
-		// merge any parsed network info into the event
-		if netInfo != nil {
-			for k, v := range netInfo {
-				e[k] = v
+			if len(raw) >= 44+1 {
+				end := 44 + 256
+				if end > len(raw) {
+					end = len(raw)
+				}
+				fnameBytes := raw[44:end]
+				if i := bytes.IndexByte(fnameBytes, 0); i >= 0 {
+					filename = string(fnameBytes[:i])
+				} else {
+					filename = string(fnameBytes)
+				}
 			}
-		}
 
-			dbg("ebpf event: ts=%s(tsMs=%d, gulpTs=%d) pid=%d tgid=%d uid=%d gid=%d evt_type=%d comm=%s filename=%s", ts, tsMs, gulpTs, pid, tgid, uid, gid, evtType, comm, filename)
+			// parse cmdline field (after filename, 4096 bytes)
+			// format: args stored in fixed 128-byte slots (MAX_ARGS=32, ARG_LEN=128)
+			// each slot contains a null-terminated string
+			// struct layout: ts(8) + pid(4) + tgid(4) + uid(4) + gid(4) + evt_type(4) + comm(16) + filename(256) = 300
+			var cmdline string
+			cmdlineBase := 300 // offset after filename (8+4+4+4+4+4+16+256)
+			cmdlineLen := 4096 // MAX_ARGS * ARG_LEN
+			argLen := 128      // ARG_LEN - fixed size per argument slot
+			maxArgs := 32      // MAX_ARGS
+			dbg("raw event length: %d, cmdlineBase: %d", len(raw), cmdlineBase)
+
+			if len(raw) >= cmdlineBase+argLen {
+				end := cmdlineBase + cmdlineLen
+				if end > len(raw) {
+					end = len(raw)
+				}
+				cmdlineBytes := raw[cmdlineBase:end]
+
+				// extract args from fixed-size slots and join with spaces
+				var args []string
+				for i := 0; i < maxArgs; i++ {
+					slotStart := i * argLen
+					slotEnd := slotStart + argLen
+					if slotEnd > len(cmdlineBytes) {
+						break
+					}
+					slot := cmdlineBytes[slotStart:slotEnd]
+					// find null terminator in slot
+					if nullIdx := bytes.IndexByte(slot, 0); nullIdx > 0 {
+						args = append(args, string(slot[:nullIdx]))
+					} else if nullIdx < 0 && len(slot) > 0 {
+						// no null found, use whole slot
+						args = append(args, string(slot))
+					}
+					// nullIdx == 0 means empty slot, stop
+					if len(slot) == 0 || slot[0] == 0 {
+						break
+					}
+				}
+				cmdline = strings.Join(args, " ")
+				dbg("parsed cmdline from %d args: '%s'", len(args), cmdline)
+			}
+
+			// Fallback: if cmdline or filename are empty (e.g. connect/accept events), try to fetch from /proc
+			// Use cache to avoid excessive I/O
+			var pInfo procInfo
+			var found bool
+
+			// If execve (evtType == 1), we must refresh because process identity changed.
+			if evtType != 1 {
+				pInfo, found = procCache[pid]
+			}
+
+			if !found || evtType == 1 {
+				// Try to read from /proc if eBPF data is missing
+				// Note: eBPF data is apparently always empty per user report, so we rely on /proc
+				newCmdline := cmdline
+				newFilename := filename
+
+				if newCmdline == "" {
+					if procCmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+						parts := bytes.Split(procCmdline, []byte{0})
+						var args []string
+						for _, p := range parts {
+							if len(p) > 0 {
+								args = append(args, string(p))
+							}
+						}
+						newCmdline = strings.Join(args, " ")
+					}
+				}
+				if newFilename == "" {
+					if exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
+						newFilename = exePath
+					}
+				}
+
+				// Update cache
+				pInfo = procInfo{name: newFilename, cmdline: newCmdline}
+				procCache[pid] = pInfo
+
+				// Simple eviction if cache grows too large
+				if len(procCache) > 10000 {
+					// Clear cache completely to avoid complexity of LRU
+					procCache = make(map[uint32]procInfo)
+				}
+			}
+
+			cmdline = pInfo.cmdline
+			filename = pInfo.name
+
+			seq := atomic.AddUint64(&globalSeq, 1)
+			// convert bpf monotonic ms to wall-clock time
+			evtNs := int64(tsMs) * 1_000_000
+			wallT, wallNs := monotonicNsToWallTime(evtNs)
+			ts := wallT.Format(time.RFC3339)
+			gulpTs := wallNs
+
+			evtAction := "unknown"
+			switch evtType {
+			case 1:
+				evtAction = "execve"
+			case 2:
+				evtAction = "connect_enter"
+			case 3:
+				evtAction = "accept_exit"
+			}
+
+			// attempt to parse optional network fields appended after cmdline
+			// layout in C: after cmdline (offset 300 + 4096 == 4396) =>
+			// family(2), sport(2), dport(2), __pad(2), saddr(4), daddr(4), saddr6(16), daddr6(16)
+			var netInfo map[string]interface{}
+			netBase := 4396 // 300 (cmdline offset) + 4096 (cmdline size)
+
+			// read family if present
+			if len(raw) >= netBase+2 {
+				family := binary.LittleEndian.Uint16(raw[netBase : netBase+2])
+				if family != 0 {
+					netInfo = map[string]interface{}{"network.family": int(family)}
+
+					// try to read ports (sport,dport) if present
+					if len(raw) >= netBase+6 {
+						sport := binary.LittleEndian.Uint16(raw[netBase+2 : netBase+4])
+						dport := binary.LittleEndian.Uint16(raw[netBase+4 : netBase+6])
+						if sport != 0 {
+							netInfo["network.sport"] = int(sport)
+						}
+						if dport != 0 {
+							netInfo["network.dport"] = int(dport)
+						}
+					}
+
+					// ipv4 addresses (saddr,daddr) - skip 2 bytes padding after dport
+					if len(raw) >= netBase+16 {
+						saddrBytes := raw[netBase+8 : netBase+12]
+						daddrBytes := raw[netBase+12 : netBase+16]
+						saddrStr := fmt.Sprintf("%d.%d.%d.%d", saddrBytes[0], saddrBytes[1], saddrBytes[2], saddrBytes[3])
+						daddrStr := fmt.Sprintf("%d.%d.%d.%d", daddrBytes[0], daddrBytes[1], daddrBytes[2], daddrBytes[3])
+						// only add non-zero addresses
+						if !(saddrBytes[0] == 0 && saddrBytes[1] == 0 && saddrBytes[2] == 0 && saddrBytes[3] == 0) {
+							netInfo["network.saddr"] = saddrStr
+						}
+						if !(daddrBytes[0] == 0 && daddrBytes[1] == 0 && daddrBytes[2] == 0 && daddrBytes[3] == 0) {
+							netInfo["network.daddr"] = daddrStr
+						}
+					}
+
+					// ipv6 addresses (offset 16 for saddr6, 32 for daddr6)
+					if len(raw) >= netBase+48 {
+						saddr6 := raw[netBase+16 : netBase+32]
+						daddr6 := raw[netBase+32 : netBase+48]
+						// ignore all-zero ipv6
+						zero6 := true
+						for i := 0; i < 16; i++ {
+							if saddr6[i] != 0 {
+								zero6 = false
+								break
+							}
+						}
+						if !zero6 {
+							netInfo["network.saddr6"] = net.IP(saddr6).String()
+						}
+						zero6 = true
+						for i := 0; i < 16; i++ {
+							if daddr6[i] != 0 {
+								zero6 = false
+								break
+							}
+						}
+						if !zero6 {
+							netInfo["network.daddr6"] = net.IP(daddr6).String()
+						}
+					}
+				}
+			}
+
+			// compute gulp.event_code as fnv hash of evtAction
+			h := fnv.New32a()
+			h.Write([]byte(evtAction))
+			eventCode := int(h.Sum32())
+
+			// determine process name from cmdline (first argument, basename) or fallback to comm
+			// cmdline contains space-separated arguments; if empty, fall back to filename
+			processName := comm
+			processCmdline := cmdline
+			if cmdline != "" && strings.TrimSpace(cmdline) != "" {
+				// first argument is the executable path
+				parts := strings.SplitN(strings.TrimSpace(cmdline), " ", 2)
+				if len(parts) > 0 && parts[0] != "" {
+					processName = filepath.Base(parts[0])
+				}
+			} else if filename != "" {
+				// fallback: use filename if available
+				processName = filepath.Base(filename)
+				processCmdline = filename
+			}
+
+			// check if process should be excluded based on executable pattern
+			if len(cfg.ProcessExclude) > 0 && shouldExcludeProcess(processName, cfg.ProcessExclude) {
+				dbg("excluding process by pattern: %s", processName)
+				continue
+			}
+
+			// build event.original with cmdline
+			eventOriginal := fmt.Sprintf("cmdline=%s pid=%d tgid=%d uid=%d gid=%d", processCmdline, pid, tgid, uid, gid)
+
+			e := Event{
+				"@timestamp":           ts,
+				"gulp.timestamp":       gulpTs,
+				"gulp.operation_id":    cfg.Gulp.OperationID,
+				"gulp.context_id":      contextID,
+				"gulp.source_id":       sourceID,
+				"agent.type":           "slurp_ebpf",
+				"event.original":       eventOriginal,
+				"event.sequence":       int(seq),
+				"event.code":           evtAction,
+				"gulp.event_code":      eventCode,
+				"event.duration":       1,
+				"process.name":         processName,
+				"process.command_line": processCmdline,
+				"process.pid":          pid,
+				"user.uid":             int(uid),
+				"user.gid":             int(gid),
+				"host.hostname":        osHostnameOrEmpty(),
+			}
+
+			// compute _id as sha256 hash of the event content
+			eventBytes, _ := json.Marshal(e)
+			idHash := sha256.Sum256(eventBytes)
+			e["_id"] = hex.EncodeToString(idHash[:])
+
+			// merge any parsed network info into the event
+			if netInfo != nil {
+				for k, v := range netInfo {
+					e[k] = v
+				}
+			}
+
+			dbg("parsed event: %v", e)
 			chunk = append(chunk, e)
 			if len(chunk) >= cfg.MaxChunkSize {
 				if err := sendPacket(ws, cfg, wsID, reqID, &chunk, false); err != nil {

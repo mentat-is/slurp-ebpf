@@ -68,8 +68,14 @@ func main() {
 	dbg("loaded config from %s", *cfgPath)
 
 	// if hooks empty, add defaults
+	// note: sys_enter_accept is needed to store sockaddr pointer for sys_exit_accept
 	if len(cfg.Hooks) == 0 {
-		cfg.Hooks = []string{"tracepoint/syscalls/sys_enter_execve", "tracepoint/syscalls/sys_enter_connect", "tracepoint/syscalls/sys_exit_accept"}
+		cfg.Hooks = []string{
+			"tracepoint/syscalls/sys_enter_execve",
+			"tracepoint/syscalls/sys_enter_connect",
+			"tracepoint/syscalls/sys_enter_accept",
+			"tracepoint/syscalls/sys_exit_accept",
+		}
 	}
 	dbg("hooks: %v", cfg.Hooks)
 

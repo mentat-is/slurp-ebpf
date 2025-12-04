@@ -10,5 +10,10 @@ OUT=../slurp_ebpf.o
 SRC=slurp_ebpf.c
 CC=clang
 
-$CC -O2 -g -target bpf -c "$SRC" -o "$OUT"
+# -D__TARGET_ARCH_x86 is needed for CO-RE on x86_64
+# -Wno-compare-distinct-pointer-types suppresses harmless warnings
+$CC -O2 -g -target bpf \
+    -D__TARGET_ARCH_x86 \
+    -Wno-compare-distinct-pointer-types \
+    -c "$SRC" -o "$OUT"
 echo "Built $OUT (from bpf/$SRC)"
