@@ -19,6 +19,10 @@
   "max_chunk_size": 1000,
   // the hooks to be installed, supported hooks are "proc_exec" (process execution), "conn_outbound" (outbound connections), "conn_inbound" (inbound connections), "login" (login events). if empty, all hooks are installed
   "hooks": [],
-  // list of patterns to exclude events by "process.name", supports wildcards
-  "process_exclude": []
+  // list of patterns to exclude events by "process.name", supports wildcards. if empty, no exclusion is performed
+  "process_exclude": [],
+  // list of patterns to exclude events by parent process "process.parent_name", supports wildcards. if empty, no exclusion is performed
+  "process_parent_exclude": [],
+  // list of patterns to include events by "process.name", supports wildcards. if empty, no inclusion filtering is performed
+  "process_include": []
 }

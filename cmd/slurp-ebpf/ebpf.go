@@ -608,6 +608,14 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			}
 
 			// check if process should be excluded based on executable pattern
+			// if process_include is configured, only allow matching processes
+			if len(cfg.ProcessInclude) > 0 {
+				if !shouldExcludeProcess(processName, cfg.ProcessInclude) {
+					dbg("skipping event because process not in include list: %s", processName)
+					continue
+				}
+			}
+			// check if process should be excluded based on executable pattern
 			if len(cfg.ProcessExclude) > 0 && shouldExcludeProcess(processName, cfg.ProcessExclude) {
 				dbg("excluding process by pattern: %s", processName)
 				continue
@@ -647,9 +655,11 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			var ppid uint32
 			var parentName string
 			if evtCode == "proc_exec" {
-				if ppid, err := getParentPid(tgid); err == nil && ppid != 0 {
+				tmpPpid, err := getParentPid(tgid)
+				if err == nil && tmpPpid != 0 {
 					// parent name may be cached in pInfo.parent; fallback to exe basename
-					parentName := pInfo.parent
+					ppid = tmpPpid
+					parentName = pInfo.parent
 					if parentName == "" {
 						parentName = parentExeBasename(ppid)
 					}
