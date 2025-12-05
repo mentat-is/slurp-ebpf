@@ -93,12 +93,17 @@ func loadConfig() (*Config, string, error) {
 	// default hooks when none specified
 	// these are logical names that will be expanded below
 	if len(cfg.Hooks) == 0 {
-		cfg.Hooks = []string{"proc_exec", "conn_outbound", "conn_inbound"}
+		cfg.Hooks = []string{"proc_exec", "conn_outbound", "conn_inbound", "login"}
 	}
 
 	// mapping from logical hook names to actual tracepoint sections
 	hookMap := map[string][]string{
 		"proc_exec": {
+			"tracepoint/syscalls/sys_enter_execve",
+			"tracepoint/syscalls/sys_exit_execve",
+			"tracepoint/sched/sched_process_exec",
+		},
+		"login": {
 			"tracepoint/syscalls/sys_enter_execve",
 			"tracepoint/syscalls/sys_exit_execve",
 			"tracepoint/sched/sched_process_exec",

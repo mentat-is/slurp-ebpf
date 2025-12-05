@@ -177,6 +177,16 @@ int tracepoint__sys_exit_execve(void *ctx)
     e->gid = (__u32)(uid_gid >> 32);
     e->evt_type = 1; // execve
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    // simple login detection: if the process comm is "login" or "sshd",
+    // mark this event as a login event (evt_type == 4). keep logic minimal
+    // to satisfy the verifier and avoid complex string functions.
+    if (e->comm[0] == 'l' && e->comm[1] == 'o' && e->comm[2] == 'g' && e->comm[3] == 'i' && e->comm[4] == 'n' && e->comm[5] == '\0') {
+        e->evt_type = 4; // login
+    } else if (e->comm[0] == 's' && e->comm[1] == 's' && e->comm[2] == 'h' && e->comm[3] == 'd') {
+        // mark sshd execs as potential logins as well (simple heuristic)
+        e->evt_type = 4; // login
+    }
     
     // Zero network fields
     e->family = 0; e->sport = 0; e->dport = 0; e->__pad = 0;
@@ -216,6 +226,14 @@ int tracepoint__sched__sched_process_exec(void *ctx)
     e->gid = (__u32)(uid_gid >> 32);
     e->evt_type = 1; // execve-like
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    // mirror the simple login heuristic used for execve exit: if comm is
+    // "login" or starts with "sshd" mark as login event.
+    if (e->comm[0] == 'l' && e->comm[1] == 'o' && e->comm[2] == 'g' && e->comm[3] == 'i' && e->comm[4] == 'n' && e->comm[5] == '\0') {
+        e->evt_type = 4; // login
+    } else if (e->comm[0] == 's' && e->comm[1] == 's' && e->comm[2] == 'h' && e->comm[3] == 'd') {
+        e->evt_type = 4; // login
+    }
 
     // keep filename/cmdline empty; user-space will read /proc/<pid>/exe
     // and /proc/<pid>/cmdline when it sees evt_type == 1

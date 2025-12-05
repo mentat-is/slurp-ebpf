@@ -292,7 +292,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			return nil
 		case rec := <-recCh:
 			var tsMs uint64
-			var pid uint32
+			var tgid uint32
 			var uid uint32
 			var gid uint32
 			var evtType uint32
@@ -303,7 +303,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				tsMs = binary.LittleEndian.Uint64(raw[0:8])
 			}
 			if len(raw) >= 16 {
-				pid = binary.LittleEndian.Uint32(raw[8:12])
+				tgid = binary.LittleEndian.Uint32(raw[12:16])
 			}
 			if len(raw) >= 28 {
 				uid = binary.LittleEndian.Uint32(raw[16:20])
@@ -379,7 +379,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 
 			// If execve (evtType == 1), we must refresh because process identity changed.
 			if evtType != 1 {
-				pInfo, found = procCache[pid]
+				pInfo, found = procCache[tgid]
 			}
 
 			if !found || evtType == 1 {
@@ -389,7 +389,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				newFilename := filename
 
 				if newCmdline == "" {
-					if procCmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+					if procCmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", tgid)); err == nil {
 						parts := bytes.Split(procCmdline, []byte{0})
 						var args []string
 						for _, p := range parts {
@@ -401,14 +401,14 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 					}
 				}
 				if newFilename == "" {
-					if exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
+					if exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", tgid)); err == nil {
 						newFilename = exePath
 					}
 				}
 
 				// Update cache
 				pInfo = procInfo{name: newFilename, cmdline: newCmdline}
-				procCache[pid] = pInfo
+				procCache[tgid] = pInfo
 
 				// Simple eviction if cache grows too large
 				if len(procCache) > 10000 {
@@ -435,6 +435,8 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				evtAction = "conn_outbound"
 			case 3:
 				evtAction = "conn_inbound"
+			case 4:
+				evtAction = "login"
 			}
 
 			// attempt to parse optional network fields appended after cmdline
@@ -549,7 +551,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				"event.duration":       1,
 				"process.name":         processName,
 				"process.command_line": processCmdline,
-				"process.pid":          pid,
+				"process.pid":          tgid,
 				"user.uid":             int(uid),
 				"user.gid":             int(gid),
 				"host.hostname":        osHostnameOrEmpty(),
