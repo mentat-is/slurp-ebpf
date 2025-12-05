@@ -91,6 +91,10 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 	}
 
 	var linksArr []link.Link
+	// track which sections we've already attached to, to avoid attaching
+	// the same tracepoint/kprobe/kretprobe more than once when multiple
+	// logical hooks map to the same underlying section (eg: proc_exec/login)
+	attached := make(map[string]struct{})
 	// build allowed hook set from config; if empty, no hooks are attached
 	allowed := map[string]struct{}{}
 	if cfg != nil {
@@ -128,6 +132,12 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 					continue
 				}
 
+				// avoid attaching the identical tracepoint section twice
+				if _, ok := attached[full]; ok {
+					dbg("skipping duplicate attach for %s", full)
+					continue
+				}
+
 				lnk, err := link.Tracepoint(parts[1], parts[2], prog, nil)
 				if err != nil {
 					for _, lk := range linksArr {
@@ -137,6 +147,7 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 					return nil, nil, fmt.Errorf("attach tracepoint %s/%s: %w", parts[1], parts[2], err)
 				}
 				linksArr = append(linksArr, lnk)
+				attached[full] = struct{}{}
 			}
 		case strings.HasPrefix(sec, "kprobe/"):
 			kname := sec[len("kprobe/"):]
@@ -152,6 +163,12 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 				continue
 			}
 
+			// avoid attaching duplicate kprobe sections
+			if _, ok := attached[sec]; ok {
+				dbg("skipping duplicate attach for %s", sec)
+				continue
+			}
+
 			lnk, err := link.Kprobe(kname, prog, nil)
 			if err != nil {
 				for _, lk := range linksArr {
@@ -161,6 +178,7 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 				return nil, nil, fmt.Errorf("attach kprobe %s: %w", kname, err)
 			}
 			linksArr = append(linksArr, lnk)
+			attached[sec] = struct{}{}
 		case strings.HasPrefix(sec, "kretprobe/"):
 			kname := sec[len("kretprobe/"):]
 			// only attach if configured
@@ -175,6 +193,12 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 				continue
 			}
 
+			// avoid attaching duplicate kretprobe sections
+			if _, ok := attached[sec]; ok {
+				dbg("skipping duplicate attach for %s", sec)
+				continue
+			}
+
 			lnk, err := link.Kretprobe(kname, prog, nil)
 			if err != nil {
 				for _, lk := range linksArr {
@@ -184,6 +208,7 @@ func ebpfSetup(bpfPath string, cfg *Config) (*ringbuf.Reader, func(), error) {
 				return nil, nil, fmt.Errorf("attach kretprobe %s: %w", kname, err)
 			}
 			linksArr = append(linksArr, lnk)
+			attached[sec] = struct{}{}
 		}
 	}
 
@@ -427,16 +452,16 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			ts := wallT.Format(time.RFC3339)
 			gulpTs := wallNs
 
-			evtAction := "unknown"
+			evtCode := "unknown"
 			switch evtType {
 			case 1:
-				evtAction = "proc_exec"
+				evtCode = "proc_exec"
 			case 2:
-				evtAction = "conn_outbound"
+				evtCode = "conn_outbound"
 			case 3:
-				evtAction = "conn_inbound"
+				evtCode = "conn_inbound"
 			case 4:
-				evtAction = "login"
+				evtCode = "login"
 			}
 
 			// attempt to parse optional network fields appended after cmdline
@@ -509,8 +534,8 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 
 			// compute gulp.event_code as fnv hash of evtAction
 			h := fnv.New32a()
-			h.Write([]byte(evtAction))
-			eventCode := int(h.Sum32())
+			h.Write([]byte(evtCode))
+			gulpEvtCode := int(h.Sum32())
 
 			// determine process name from cmdline (first argument, basename) or fallback to comm
 			// cmdline contains space-separated arguments; if empty, fall back to filename
@@ -535,7 +560,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			}
 
 			// event original is just a dummy placeholder here (every information is already structured into fields)
-			eventOriginal := "-"
+			evtOriginal := "-"
 
 			e := Event{
 				"@timestamp":           ts,
@@ -544,10 +569,10 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				"gulp.context_id":      contextID,
 				"gulp.source_id":       sourceID,
 				"agent.type":           "slurp_ebpf",
-				"event.original":       eventOriginal,
+				"event.original":       evtOriginal,
 				"event.sequence":       int(seq),
-				"event.code":           evtAction,
-				"gulp.event_code":      eventCode,
+				"event.code":           evtCode,
+				"gulp.event_code":      gulpEvtCode,
 				"event.duration":       1,
 				"process.name":         processName,
 				"process.command_line": processCmdline,
@@ -569,7 +594,11 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			idHash := sha256.Sum256(eventBytes)
 			e["_id"] = hex.EncodeToString(idHash[:])
 
-			dbg("parsed event: %v", e)
+			sliceLen := len(processCmdline)
+			if sliceLen > 260 {
+				sliceLen = 260
+			}
+			dbg("seq=%d, ts=%s (%d), evt=%s, pid=%d, user=%d, process=%s, cmd=%s", seq, ts, gulpTs, evtCode, tgid, uid, processName, processCmdline[0:sliceLen])
 
 			// append to chunk
 			chunk = append(chunk, e)

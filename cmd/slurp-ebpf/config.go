@@ -99,13 +99,13 @@ func loadConfig() (*Config, string, error) {
 	// mapping from logical hook names to actual tracepoint sections
 	hookMap := map[string][]string{
 		"proc_exec": {
-			"tracepoint/syscalls/sys_enter_execve",
-			"tracepoint/syscalls/sys_exit_execve",
+			//"tracepoint/syscalls/sys_enter_execve",
+			//"tracepoint/syscalls/sys_exit_execve",
 			"tracepoint/sched/sched_process_exec",
 		},
 		"login": {
-			"tracepoint/syscalls/sys_enter_execve",
-			"tracepoint/syscalls/sys_exit_execve",
+			//"tracepoint/syscalls/sys_enter_execve",
+			//"tracepoint/syscalls/sys_exit_execve",
 			"tracepoint/sched/sched_process_exec",
 		},
 		"conn_outbound": {
