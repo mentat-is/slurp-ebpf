@@ -6,7 +6,9 @@ set -euo pipefail
 #   sudo pacman -S llvm bpf clang libelf linux-headers 
 #   ./build_ebpf.sh
 
-OUT=../slurp_ebpf.o
+_SLURP_DIR=~/.config/slurp
+mkdir -p "$_SLURP_DIR"
+OUT="$_SLURP_DIR/slurp_ebpf.o"
 SRC=slurp_ebpf.c
 CC=clang
 

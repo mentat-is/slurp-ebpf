@@ -74,88 +74,29 @@ build the Go binary and the eBPF object. the repo provides a small helper to bui
 cd ebpf
 ./build_ebpf.sh
 
-# build the go binaries
-go build -o slurp-ebpf ./cmd/slurp-ebpf
+# build the go binary (sets the embedded version to 1.0.0, remove to not embed)
+BUILD_VERSION=1.0.0 ./build.sh
 ```
 
-> by default, the agent will load `slurp_ebpf.o` in the current directory (use config `bpf_object` to override the path).
+> by default, the agent will load `slurp_ebpf.o` from `$HOME/.config/slurp`.
 
 ```bash
-# or, build and run in one step, -debug enables verbose logging
-./build_and_run.sh --debug
+# or, build and run in one step, --debug enables verbose logging
+# will use default SLURP_CONFIG_DIR as $HOME/.config/slurp
+BUILD_VERSION=1.0.0 ./build_and_run.sh --debug
 ```
 
 ## Configuration
 
-example `slurp_cfg.json` (the repo includes a sample):
+configuration must be provided in `$GULP_CONFIG_DIR/slurp_cfg.json`, defaults to `$HOME/.config/slurp/slurp_cfg.json` if not found (a default file will be created).
 
-```json
-{
-  "gulp": {
-    "uri": "http://localhost:8080",
-    "username": "ingest",
-    "password": "ingest",
-    "operation_id": "test_operation"
-  },
-  "max_chunk_size": 1000,
-  "hooks": ["sys_enter_execve"],
-  "process_exclude": ["*/systemd*", "/usr/bin/some_noisy_app"]
-}
-```
-
-- `max_chunk_size`: maximum number of events sent in a single websocket packet (default 1000)
-- `gulp.uri`: http/s address of the gulp server
-- `gulp.username`: username
-- `gulp.password`: password
-- `hooks`: list of hooks (tracepoint short-names or full sections) to attach, supported hooks:
-    - `sys_enter_execve` : traces process execve calls (process creation)
-    - `sys_enter_connect` : traces socket connect calls (outgoing connections)
-    - `sys_enter_accept` + `sys_exit_accept` : traces socket accept calls (incoming connections, both hooks are required)
-  
-- `bpf_object` (optional): path to the compiled eBPF object; defaults to `./slurp_ebpf.o`
-- `process_exclude` (optional): list of patterns to exclude events by `process.name`. supports wildcards:
-    - `*` matches any sequence of characters
-    - `?` matches a single character
-    - example: `["/usr/bin/some_noisy_app", "*/systemd*"]`
-
-TLS / Client certificates
-
-The agent supports HTTPS/WSS connections using client certificates (PEM format). The following fields are available under the `gulp` section of the configuration:
-
-- `gulp.cert_file`: path to client certificate (PEM). default: `./certs/client.crt`
-- `gulp.key_file`: path to client private key (PEM). default: `./certs/client.key`
-- `gulp.ca_cert_file`: path to CA certificate (PEM) used to verify the server. default: `./certs/ca.crt`
-- `gulp.use_self_signed`: boolean, when `true` the agent will allow connections to servers using self-signed certificates (skips verification).
-
-If the certificate files are present they will be used automatically for both the HTTP login request and the `wss` websocket connection. To connect to a server using a self-signed certificate, set `gulp.use_self_signed` to `true`.
-
-Example (with client certs):
-
-```json
-{
-  "gulp": {
-    "uri": "https://gulp.example.com",
-    "username": "ingest",
-    "password": "ingest",
-    "operation_id": "test_operation",
-    "cert_file": "./certs/client.crt",
-    "key_file": "./certs/client.key",
-    "ca_cert_file": "./certs/ca.crt",
-    "use_self_signed": false
-  }
-}
-```
+an [example commented configuration file is provided](./slurp_cfg_template.json)
 
 ## Run
 
-the agent accepts a `--config` path and `--debug` flag.
-
 ```bash
-# run (requires root to load eBPF programs), uses configuration from slurp_cfg.json (by default, it loads the default configuration file slurp_cfg.json in the current directory)
-sudo ./slurp-ebpf --config ./slurp_cfg.json
-
-# also enables debug logging
-sudo ./slurp-ebpf --config ./slurp_cfg.json --debug
+# run the agent (requires root), also enable debug logging
+sudo ./slurp-ebpf --debug
 ```
 
 the agent will authenticate to the configured Gulp server, connect over WebSocket, attach the requested eBPF hooks and start sending event chunks. press `Ctrl-C` to stop — the agent will send a final chunk before exiting.

@@ -10,16 +10,20 @@ if [ -x "./ebpf/build_ebpf.sh" ]; then
 else
   ./ebpf/build_ebpf.sh
 fi
+if [ $? -ne 0 ]; then
+  echo "[slurp-ebpf] Error: Failed to build BPF object."
+  exit 1
+fi
 
 echo "[slurp-ebpf] Building Go binary..."
-go build -o slurp-ebpf ./cmd/slurp-ebpf
+./build.sh
+if [ $? -ne 0 ]; then
+  echo "[slurp-ebpf] Error: Failed to build Go binary."
+  exit 1
+fi  
 
 echo "[slurp-ebpf] Ready to run. Note: loading BPF objects requires root privileges."
-if [ "$#" -gt 0 ]; then
-  ARGS="$@"
-else
-  ARGS="--config slurp_cfg.json"
-fi
+ARGS="$@"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "[slurp-ebpf] Not running as root; using sudo to execute slurp-ebpf. You may be prompted for a password."

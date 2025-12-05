@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gorilla/websocket"
@@ -142,35 +143,41 @@ func login(ctx context.Context, g GulpConfig) (string, error) {
 // tlsConfigFromGulp builds a tls.Config based on paths in GulpConfig. If no
 // cert/key/ca are present the returned tls.Config may be nil.
 func tlsConfigFromGulp(g GulpConfig) (*tls.Config, error) {
-	// if TLS is not requested at all, return nil to indicate no TLS config
-	if !shouldUseTLS(g) {
-		return nil, nil
-	}
-
 	var cfg tls.Config
 
-	// try to load client cert if both provided and exist
-	if g.CertFile != "" && g.KeyFile != "" {
-		if _, err := os.Stat(g.CertFile); err == nil {
-			if _, err := os.Stat(g.KeyFile); err == nil {
-				cert, err := tls.LoadX509KeyPair(g.CertFile, g.KeyFile)
-				if err != nil {
-					return nil, fmt.Errorf("failed to load client cert/key: %w", err)
-				}
-				cfg.Certificates = []tls.Certificate{cert}
-			}
+	// only load client certs when explicitly requested via use_certs
+	if g.UseCerts {
+		// use certificates under SLURP_CERT_PATHS if set. when unset,
+		// default to $SLURP_CONFIG_PATH/certs (or ~/.config/slurp/certs) and
+		// create the directory if it doesn't exist.
+		certsDir := os.Getenv("SLURP_CERT_PATHS")
+		if certsDir == "" {
+			// use $SLURP_CONFIG_PATH/certs
+			cfgDir := slurpConfigDir()
+			certsDir = filepath.Join(cfgDir, "certs")
+			_ = os.MkdirAll(certsDir, 0700)
 		}
-	}
+		envCert := filepath.Join(certsDir, "slurp.pem")
+		envKey := filepath.Join(certsDir, "slurp-key.pem")
+		envCA := filepath.Join(certsDir, "ca.pem")
 
-	// load custom CA if provided
-	if g.CACertFile != "" {
-		if b, err := os.ReadFile(g.CACertFile); err == nil {
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(b) {
-				return nil, fmt.Errorf("failed to parse CA cert PEM")
-			}
-			cfg.RootCAs = pool
+		// load client cert/key
+		cert, err := tls.LoadX509KeyPair(envCert, envKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client cert/key from %s: %w", certsDir, err)
 		}
+		cfg.Certificates = []tls.Certificate{cert}
+
+		// load CA
+		b, err := os.ReadFile(envCA)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA cert from %s: %w", envCA, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(b) {
+			return nil, fmt.Errorf("failed to parse CA cert PEM from %s", envCA)
+		}
+		cfg.RootCAs = pool
 	}
 
 	if g.SkipTLSVerify {
@@ -200,31 +207,9 @@ func httpClientForGulp(g GulpConfig) (*http.Client, error) {
 // TLS is enabled when the gulp URI uses https, when client certs/CA are
 // provided, or when use_self_signed is set.
 func shouldUseTLS(g GulpConfig) bool {
-	// if uri explicitly https, use TLS
-	if strings.HasPrefix(strings.ToLower(g.URI), "https://") {
-		return true
-	}
-	// if skip-tls-verify option requested, enable TLS (but skip verification)
-	if g.SkipTLSVerify {
-		return true
-	}
-	// if any of the cert files are present on disk, enable TLS
-	if g.CertFile != "" {
-		if _, err := os.Stat(g.CertFile); err == nil {
-			return true
-		}
-	}
-	if g.KeyFile != "" {
-		if _, err := os.Stat(g.KeyFile); err == nil {
-			return true
-		}
-	}
-	if g.CACertFile != "" {
-		if _, err := os.Stat(g.CACertFile); err == nil {
-			return true
-		}
-	}
-	return false
+	// only enable TLS when the configured URI is https. client certs and
+	// skip-tls-verify are only meaningful for https URIs per config semantics.
+	return strings.HasPrefix(strings.ToLower(g.URI), "https://")
 }
 
 // wsURLFromURI builds the websocket ingest URL from the base URI. If useTLS

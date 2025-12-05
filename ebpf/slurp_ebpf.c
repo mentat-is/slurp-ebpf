@@ -196,6 +196,42 @@ int tracepoint__sys_exit_execve(void *ctx)
     return 0;
 }
 
+// fallback tracepoint to catch exec events that may not be observed via
+// syscall tracepoints (covers execveat and other exec paths). this emits
+// a lightweight exec event so user-space can read /proc to populate
+// filename/cmdline when needed.
+SEC("tracepoint/sched/sched_process_exec")
+int tracepoint__sched__sched_process_exec(void *ctx)
+{
+    struct event *e = get_event();
+    if (!e) return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 uid_gid = bpf_get_current_uid_gid();
+
+    e->ts_ms = bpf_ktime_get_ns() / 1000000ULL;
+    e->pid = (__u32)pid_tgid;
+    e->tgid = (__u32)(pid_tgid >> 32);
+    e->uid = (__u32)uid_gid;
+    e->gid = (__u32)(uid_gid >> 32);
+    e->evt_type = 1; // execve-like
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    // keep filename/cmdline empty; user-space will read /proc/<pid>/exe
+    // and /proc/<pid>/cmdline when it sees evt_type == 1
+    e->filename[0] = 0;
+    e->cmdline[0] = 0;
+
+    // zero network fields
+    e->family = 0; e->sport = 0; e->dport = 0; e->__pad = 0;
+    e->saddr = 0; e->daddr = 0;
+    __builtin_memset(e->saddr6, 0, 16);
+    __builtin_memset(e->daddr6, 0, 16);
+
+    bpf_ringbuf_output(&events, e, sizeof(*e), 0);
+    return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_connect")
 int tracepoint__sys_enter_connect(void *ctx)
 {

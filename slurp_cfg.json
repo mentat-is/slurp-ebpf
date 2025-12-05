@@ -1,10 +1,1 @@
-{
-  "gulp": {
-    "uri": "http://localhost:8080",
-    "username": "admin",
-    "password": "admin",
-    "operation_id": "test_operation"
-  },
-  "max_chunk_size": 1000,
-  "hooks": []
-}
+/home/valerino/.config/slurp/slurp_cfg.json

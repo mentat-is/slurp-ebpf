@@ -2,96 +2,97 @@ package main
 
 import (
 	"context"
-	"crypto/sha1"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/socialviolation/asciiban/ascii"
 )
 
-// Event is a generic event shape we will send as raw data
-type Event map[string]any
+// debugFlag is set via --debugFlag flag
+var debugFlag bool
 
-var globalSeq uint64
-var debug bool
+// AppVersion is set during build via ldflags (default is "dev". see build.sh)
+var AppVersion = "dev"
 
 func dbg(format string, args ...interface{}) {
-	if !debug {
+	if !debugFlag {
 		return
 	}
 	log.Printf(format, args...)
 }
 
-// buildContextIDs computes context/source ids from hostname
-func buildContextIDs() (string, string) {
-	hn, _ := os.Hostname()
-	h := sha1.Sum([]byte(hn))
-	hexh := hex.EncodeToString(h[:])
-	// use full sha1 hex as context_id and source_id
-	return hexh, hexh
-}
+// getAppVersion returns the embedded application version string with git commit hash.
+func getAppVersion() string {
+	buildInfo, _ := debug.ReadBuildInfo()
+	var build string
 
-func osHostnameOrEmpty() string {
-	hn, err := os.Hostname()
-	if err != nil {
-		return ""
+	for _, setting := range buildInfo.Settings {
+		if setting.Key == "vcs.revision" {
+			// git commit hash
+			build = setting.Value
+		} else if setting.Key == "main.AppVersion" {
+			// set by ldflags during build (i.e. 1.0.0)
+			AppVersion = setting.Value
+		}
 	}
-	return hn
+
+	// return version string
+	return fmt.Sprintf("%s(%s)", AppVersion, build[:8])
 }
 
-// Chunk sender and reader helpers were moved to separate files in the project root.
+// banner renders and returns the slurp ASCII art banner.
+func banner() string {
+	// select a random font and palette
+	fonts := ascii.GetFonts()
+	var font string = ascii.RandomFont(fonts...)
+	var palette ascii.Palette = ascii.RandomPalette()
 
-// Chunk sender and reader helpers were moved to separate files in the project root.
+	// render banner to string
+	s := ascii.Render([]ascii.BannerOption{ascii.WithMessage("slurp"), ascii.WithFont(font), ascii.WithPalette(palette)}...)
+	s += "\neBPF-powered realtime ingestion agent for https://github.com/mentat-is/gulp"
+	s += fmt.Sprintf("\nversion: %s\n", getAppVersion())
+	return s
+}
 
 func main() {
-	cfgPath := flag.String("config", "slurp_cfg.json", "path to config file")
+	cfgDir := slurpConfigDir()
 	dbgFlag := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
-	debug = *dbgFlag
-	dbg("starting slurp-ebpf (debug=%v)", debug)
+	debugFlag = *dbgFlag
+	
+	fmt.Printf("%s\n\n. starting slurp-ebpf (config dir=%s, debug=%v)\n", banner(), cfgDir, debugFlag)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	cfg, err := loadConfig(*cfgPath)
+	// load configuration
+	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(2)
 	}
-	dbg("loaded config from %s", *cfgPath)
-
-	// if hooks empty, add defaults
-	// note: sys_enter_accept is needed to store sockaddr pointer for sys_exit_accept
-	if len(cfg.Hooks) == 0 {
-		cfg.Hooks = []string{
-			"tracepoint/syscalls/sys_enter_execve",
-			"tracepoint/syscalls/sys_enter_connect",
-			"tracepoint/syscalls/sys_enter_accept",
-			"tracepoint/syscalls/sys_exit_accept",
-		}
-	}
-	dbg("hooks: %v", cfg.Hooks)
+	dbg("loaded config from %s", cfgPath)
 
 	// login to Gulp HTTP API to get token
 	token, err := login(ctx, cfg.Gulp)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
 	}
 	dbg("login successful, token length=%d", len(token))
 
-	// websocket URL and TLS decision are determined below
-
-	// build tls config from gulp settings (may be nil)
-	// decide whether to use TLS: only use TLS when the gulp URI is https or
-	// when certificates/options are provided in the config. otherwise use plain ws/http.
+	// decide whether to use TLS: only use TLS when the gulp URI is https.
+	// otherwise use plain ws/http.
 	useTLS := shouldUseTLS(cfg.Gulp)
 	var wsURL string
 	wsURL, err = wsURLFromURI(cfg.Gulp.URI, useTLS)
@@ -163,10 +164,7 @@ func main() {
 
 	// start event producer from eBPF object (reader will also send chunks)
 	prodCtx, prodCancel := context.WithCancel(ctx)
-	bpfPath := cfg.BpfObject
-	if bpfPath == "" {
-		bpfPath = "./slurp_ebpf.o"
-	}
+	bpfPath := filepath.Join(cfgDir, "slurp_ebpf.o")
 	if _, err := os.Stat(bpfPath); err != nil {
 		fmt.Fprintf(os.Stderr, "bpf object not found: %s\n", bpfPath)
 		os.Exit(2)

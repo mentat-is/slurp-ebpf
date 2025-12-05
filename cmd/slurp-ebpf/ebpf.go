@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -24,13 +25,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// matchPattern checks if s matches pattern with wildcard support.
-// supports * (matches any sequence) and ? (matches single character).
-func matchPattern(pattern, s string) bool {
-	return matchPatternHelper(pattern, s)
-}
+// Event is a generic event shape we will send as raw data
+type Event map[string]any
+
+var globalSeq uint64
 
 // matchPatternHelper is a recursive helper for glob-style pattern matching.
+// supports * (matches any sequence) and ? (matches single character).
 func matchPatternHelper(pattern, s string) bool {
 	for len(pattern) > 0 {
 		switch pattern[0] {
@@ -69,7 +70,7 @@ func matchPatternHelper(pattern, s string) bool {
 // shouldExcludeProcess checks if the executable matches any exclusion pattern.
 func shouldExcludeProcess(executable string, patterns []string) bool {
 	for _, pattern := range patterns {
-		if matchPattern(pattern, executable) {
+		if matchPatternHelper(pattern, executable) {
 			return true
 		}
 	}
@@ -290,21 +291,19 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			_ = sendPacket(ws, cfg, wsID, reqID, &chunk, true)
 			return nil
 		case rec := <-recCh:
-			raw := rec.RawSample
 			var tsMs uint64
 			var pid uint32
-			var tgid uint32
 			var uid uint32
 			var gid uint32
 			var evtType uint32
 			var comm string
 			var filename string
+			raw := rec.RawSample
 			if len(raw) >= 8 {
 				tsMs = binary.LittleEndian.Uint64(raw[0:8])
 			}
 			if len(raw) >= 16 {
 				pid = binary.LittleEndian.Uint32(raw[8:12])
-				tgid = binary.LittleEndian.Uint32(raw[12:16])
 			}
 			if len(raw) >= 28 {
 				uid = binary.LittleEndian.Uint32(raw[16:20])
@@ -341,7 +340,6 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			cmdlineLen := 4096 // MAX_ARGS * ARG_LEN
 			argLen := 128      // ARG_LEN - fixed size per argument slot
 			maxArgs := 32      // MAX_ARGS
-			dbg("raw event length: %d, cmdlineBase: %d", len(raw), cmdlineBase)
 
 			if len(raw) >= cmdlineBase+argLen {
 				end := cmdlineBase + cmdlineLen
@@ -372,7 +370,6 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 					}
 				}
 				cmdline = strings.Join(args, " ")
-				dbg("parsed cmdline from %d args: '%s'", len(args), cmdline)
 			}
 
 			// Fallback: if cmdline or filename are empty (e.g. connect/accept events), try to fetch from /proc
@@ -433,11 +430,11 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			evtAction := "unknown"
 			switch evtType {
 			case 1:
-				evtAction = "execve"
+				evtAction = "proc_exec"
 			case 2:
-				evtAction = "connect_enter"
+				evtAction = "conn_outbound"
 			case 3:
-				evtAction = "accept_exit"
+				evtAction = "conn_inbound"
 			}
 
 			// attempt to parse optional network fields appended after cmdline
@@ -535,8 +532,8 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				continue
 			}
 
-			// build event.original with cmdline
-			eventOriginal := fmt.Sprintf("cmdline=%s pid=%d tgid=%d uid=%d gid=%d", processCmdline, pid, tgid, uid, gid)
+			// event original is just a dummy placeholder here (every information is already structured into fields)
+			eventOriginal := "-"
 
 			e := Event{
 				"@timestamp":           ts,
@@ -558,11 +555,6 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				"host.hostname":        osHostnameOrEmpty(),
 			}
 
-			// compute _id as sha256 hash of the event content
-			eventBytes, _ := json.Marshal(e)
-			idHash := sha256.Sum256(eventBytes)
-			e["_id"] = hex.EncodeToString(idHash[:])
-
 			// merge any parsed network info into the event
 			if netInfo != nil {
 				for k, v := range netInfo {
@@ -570,9 +562,17 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				}
 			}
 
+			// compute _id as sha256 hash of the event content
+			eventBytes, _ := json.Marshal(e)
+			idHash := sha256.Sum256(eventBytes)
+			e["_id"] = hex.EncodeToString(idHash[:])
+
 			dbg("parsed event: %v", e)
+
+			// append to chunk
 			chunk = append(chunk, e)
 			if len(chunk) >= cfg.MaxChunkSize {
+				// threshold reached; send chunk
 				if err := sendPacket(ws, cfg, wsID, reqID, &chunk, false); err != nil {
 					return err
 				}
@@ -613,6 +613,23 @@ func monotonicNsToWallTime(evtNs int64) (time.Time, int64) {
 	}
 	// fallback: treat evtNs as unix-ns (best-effort)
 	return time.Unix(0, evtNs).UTC(), evtNs
+}
+
+func osHostnameOrEmpty() string {
+	hn, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return hn
+}
+
+// buildContextIDs computes context/source ids from hostname
+func buildContextIDs() (string, string) {
+	hn, _ := os.Hostname()
+	h := sha1.Sum([]byte(hn))
+	hexh := hex.EncodeToString(h[:])
+	// use full sha1 hex as context_id and source_id
+	return hexh, hexh
 }
 
 // readEbpfEvents is a small wrapper used by the caller to start the reader.

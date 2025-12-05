@@ -1,0 +1,24 @@
+{
+  // gulp endpoint configuration
+  "gulp": {
+    // gulp host::port
+    "uri": "http://localhost:8080",
+    // gulp username
+    "username": "admin",
+    // gulp password
+    "password": "admin",
+    // gulp operation id to ingest data under
+    "operation_id": "test_operation",
+    // if set and uri uses https, whether to use client certificates for mutual TLS authentication with gulp
+    // certificates must be provided in ./certs/ directory as slurp.pem, slurp-key.pem (without password), ca.pem
+    "use_certs": false,
+    // whether to skip TLS verification when connecting to gulp over https
+    "skip_tls_verify": true
+  },
+  // maximum chunk size for data ingestion (data is buffered then flushed every 15 seconds or when this size is reached)  
+  "max_chunk_size": 1000,
+  // the hooks to be installed, supported hooks are "proc_exec" (process execution), "conn_outbound" (outbound connections), "conn_inbound" (inbound connections). if empty, all hooks are installed
+  "hooks": [],
+  // list of patterns to exclude events by "process.name", supports wildcards
+  "process_exclude": []
+}
