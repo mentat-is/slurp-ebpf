@@ -18,6 +18,9 @@ type Config struct {
 	Hooks        []string `json:"hooks"`
 	// process_exclude: list of patterns to exclude events by process.executable (wildcards supported)
 	ProcessExclude []string `json:"process_exclude,omitempty"`
+	// process_parent_exclude: list of patterns to exclude events when the parent
+	// process executable matches (wildcards supported)
+	ProcessParentExclude []string `json:"process_parent_exclude,omitempty"`
 }
 
 // GulpConfig contains credentials and URI for Gulp.

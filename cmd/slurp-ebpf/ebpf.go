@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -75,6 +76,43 @@ func shouldExcludeProcess(executable string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// getParentPid reads /proc/<pid>/status and returns the parent pid (PPid).
+func getParentPid(pid uint32) (uint32, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0, err
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "PPid:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				v, err := strconv.Atoi(fields[1])
+				if err != nil {
+					return 0, err
+				}
+				return uint32(v), nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("ppid not found")
+}
+
+// parentExeBasename returns the basename of the parent process executable
+// for the given pid, or empty string if unavailable.
+func parentExeBasename(ppid uint32) string {
+	if ppid == 0 {
+		return ""
+	}
+	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ppid)); err == nil {
+		return filepath.Base(exe)
+	}
+	if commb, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", ppid)); err == nil {
+		return strings.TrimSpace(string(commb))
+	}
+	return ""
 }
 
 // ebpfSetup loads the BPF collection, attaches programs declared in cfg.Hooks
@@ -285,6 +323,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 	type procInfo struct {
 		name    string
 		cmdline string
+		parent  string
 	}
 	procCache := make(map[uint32]procInfo)
 
@@ -431,8 +470,14 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 					}
 				}
 
+				// determine parent process name when available
+				parentName := ""
+				if ppid, err := getParentPid(tgid); err == nil && ppid != 0 {
+					parentName = parentExeBasename(ppid)
+				}
+
 				// Update cache
-				pInfo = procInfo{name: newFilename, cmdline: newCmdline}
+				pInfo = procInfo{name: newFilename, cmdline: newCmdline, parent: parentName}
 				procCache[tgid] = pInfo
 
 				// Simple eviction if cache grows too large
@@ -444,6 +489,15 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 
 			cmdline = pInfo.cmdline
 			filename = pInfo.name
+
+			// if parent-based exclusions are configured, skip events whose
+			// parent process matches the configured patterns
+			if len(cfg.ProcessParentExclude) > 0 && pInfo.parent != "" {
+				if shouldExcludeProcess(pInfo.parent, cfg.ProcessParentExclude) {
+					dbg("excluding event because parent matches pattern: %s", pInfo.parent)
+					continue
+				}
+			}
 
 			seq := atomic.AddUint64(&globalSeq, 1)
 			// convert bpf monotonic ms to wall-clock time
@@ -589,16 +643,29 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				}
 			}
 
+			// for exec events, enrich with parent process information when available
+			var ppid uint32
+			var parentName string
+			if evtCode == "proc_exec" {
+				if ppid, err := getParentPid(tgid); err == nil && ppid != 0 {
+					// parent name may be cached in pInfo.parent; fallback to exe basename
+					parentName := pInfo.parent
+					if parentName == "" {
+						parentName = parentExeBasename(ppid)
+					}
+					// attach parent fields to event
+					e["process.parent.pid"] = int(ppid)
+					e["process.parent.name"] = parentName
+				}
+			}
+
 			// compute _id as sha256 hash of the event content
 			eventBytes, _ := json.Marshal(e)
 			idHash := sha256.Sum256(eventBytes)
 			e["_id"] = hex.EncodeToString(idHash[:])
 
-			sliceLen := len(processCmdline)
-			if sliceLen > 260 {
-				sliceLen = 260
-			}
-			dbg("seq=%d, ts=%s (%d), evt=%s, pid=%d, user=%d, process=%s, cmd=%s", seq, ts, gulpTs, evtCode, tgid, uid, processName, processCmdline[0:sliceLen])
+			sliceLen := min(len(processCmdline), 260)
+			dbg("seq=%d, ts=%s(%d), evt=%s, pid=%d, ppid=%d, process=%s, parent=%s, cmd=%s", seq, ts, gulpTs, evtCode, tgid, ppid, processName, parentName, processCmdline[0:sliceLen])
 
 			// append to chunk
 			chunk = append(chunk, e)
