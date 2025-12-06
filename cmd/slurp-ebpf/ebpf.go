@@ -88,33 +88,147 @@ func intSliceContains(a []int, v int) bool {
 	return false
 }
 
-// ipListMatches checks whether the given ipStr matches any ip in the list.
-// entries and ipStr are parsed with net.ParseIP and compared using Equal.
+// ipListMatches checks whether the given ipStr matches any pattern in the
+// list. Patterns support simple wildcards '*' and '?', for example
+// "192.168.*". an empty string pattern matches an empty/missing ip.
 func ipListMatches(list []string, ipStr string) bool {
-	if ipStr == "" {
-		return false
-	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	for _, candidate := range list {
-		if candidate == "" {
-			continue
-		}
-		cip := net.ParseIP(candidate)
-		if cip == nil {
-			// compare raw string fallback
-			if candidate == ipStr {
+	// use the ipStr as-is; empty string means missing address
+	s := ipStr
+	for _, pattern := range list {
+		// treat an empty pattern as a match for an empty/missing ip
+		if pattern == "" {
+			if s == "" {
 				return true
 			}
 			continue
 		}
-		if cip.Equal(ip) {
+		if matchPatternHelper(pattern, s) {
 			return true
 		}
 	}
 	return false
+}
+
+// parseCmdlineAndFilename extracts the command line and filename from raw
+// ebpf sample bytes. It handles the fixed-layout slot format used by the
+// eBPF program and returns (cmdline, filename).
+func parseCmdlineAndFilename(raw []byte) (string, string) {
+	// offsets and sizes mirrored from C layout
+	cmdlineBase := 300 // offset after filename (8+4+4+4+4+4+16+256)
+	cmdlineLen := 4096 // MAX_ARGS * ARG_LEN
+	argLen := 128      // ARG_LEN - fixed size per argument slot
+	maxArgs := 32      // MAX_ARGS
+
+	filename := ""
+	// filename is stored at offset 44, 256 bytes long
+	if len(raw) >= 44+1 {
+		end := 44 + 256
+		if end > len(raw) {
+			end = len(raw)
+		}
+		fnameBytes := raw[44:end]
+		if i := bytes.IndexByte(fnameBytes, 0); i >= 0 {
+			filename = string(fnameBytes[:i])
+		} else {
+			filename = string(fnameBytes)
+		}
+	}
+
+	if len(raw) < cmdlineBase+argLen {
+		return "", filename
+	}
+
+	end := cmdlineBase + cmdlineLen
+	if end > len(raw) {
+		end = len(raw)
+	}
+	cmdlineBytes := raw[cmdlineBase:end]
+
+	var args []string
+	for i := 0; i < maxArgs; i++ {
+		slotStart := i * argLen
+		slotEnd := slotStart + argLen
+		if slotEnd > len(cmdlineBytes) {
+			break
+		}
+		slot := cmdlineBytes[slotStart:slotEnd]
+		if len(slot) == 0 || slot[0] == 0 {
+			break
+		}
+		if nullIdx := bytes.IndexByte(slot, 0); nullIdx > 0 {
+			args = append(args, string(slot[:nullIdx]))
+		} else {
+			// trim trailing zero bytes if present
+			args = append(args, string(bytes.TrimRight(slot, "\x00")))
+		}
+	}
+	return strings.Join(args, " "), filename
+}
+
+// parseNetworkInfo extracts network fields from raw sample at the provided
+// base offset. It returns a map of fields similar to the previous inline
+// logic (network.family, network.sport, network.dport, network.saddr, etc.).
+func parseNetworkInfo(raw []byte, netBase int) map[string]interface{} {
+	if len(raw) < netBase+2 {
+		return nil
+	}
+	family := binary.LittleEndian.Uint16(raw[netBase : netBase+2])
+	if family == 0 {
+		return nil
+	}
+	info := make(map[string]interface{})
+	info["network.family"] = int(family)
+
+	if len(raw) >= netBase+6 {
+		sport := binary.LittleEndian.Uint16(raw[netBase+2 : netBase+4])
+		dport := binary.LittleEndian.Uint16(raw[netBase+4 : netBase+6])
+		if sport != 0 {
+			info["network.sport"] = int(sport)
+		}
+		if dport != 0 {
+			info["network.dport"] = int(dport)
+		}
+	}
+
+	if len(raw) >= netBase+16 {
+		saddrBytes := raw[netBase+8 : netBase+12]
+		daddrBytes := raw[netBase+12 : netBase+16]
+		if !(saddrBytes[0] == 0 && saddrBytes[1] == 0 && saddrBytes[2] == 0 && saddrBytes[3] == 0) {
+			saddrStr := fmt.Sprintf("%d.%d.%d.%d", saddrBytes[0], saddrBytes[1], saddrBytes[2], saddrBytes[3])
+			info["network.saddr"] = saddrStr
+		}
+		if !(daddrBytes[0] == 0 && daddrBytes[1] == 0 && daddrBytes[2] == 0 && daddrBytes[3] == 0) {
+			daddrStr := fmt.Sprintf("%d.%d.%d.%d", daddrBytes[0], daddrBytes[1], daddrBytes[2], daddrBytes[3])
+			info["network.daddr"] = daddrStr
+		}
+	}
+
+	if len(raw) >= netBase+48 {
+		saddr6 := raw[netBase+16 : netBase+32]
+		daddr6 := raw[netBase+32 : netBase+48]
+		zero6 := true
+		for i := 0; i < 16; i++ {
+			if saddr6[i] != 0 {
+				zero6 = false
+				break
+			}
+		}
+		if !zero6 {
+			info["network.saddr6"] = net.IP(saddr6).String()
+		}
+		zero6 = true
+		for i := 0; i < 16; i++ {
+			if daddr6[i] != 0 {
+				zero6 = false
+				break
+			}
+		}
+		if !zero6 {
+			info["network.daddr6"] = net.IP(daddr6).String()
+		}
+	}
+
+	return info
 }
 
 // getParentPid reads /proc/<pid>/status and returns the parent pid (PPid).
@@ -360,9 +474,10 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 
 	// simple cache for process info to avoid hitting /proc for every event
 	type procInfo struct {
-		name    string
-		cmdline string
-		parent  string
+		name      string
+		cmdline   string
+		parent    string
+		parentPid uint32
 	}
 	procCache := make(map[uint32]procInfo)
 
@@ -401,6 +516,7 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			var evtType uint32
 			var comm string
 			var filename string
+			var cmdline string
 			raw := rec.RawSample
 			if len(raw) >= 8 {
 				tsMs = binary.LittleEndian.Uint64(raw[0:8])
@@ -434,47 +550,8 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				}
 			}
 
-			// parse cmdline field (after filename, 4096 bytes)
-			// format: args stored in fixed 128-byte slots (MAX_ARGS=32, ARG_LEN=128)
-			// each slot contains a null-terminated string
-			// struct layout: ts(8) + pid(4) + tgid(4) + uid(4) + gid(4) + evt_type(4) + comm(16) + filename(256) = 300
-			var cmdline string
-			cmdlineBase := 300 // offset after filename (8+4+4+4+4+4+16+256)
-			cmdlineLen := 4096 // MAX_ARGS * ARG_LEN
-			argLen := 128      // ARG_LEN - fixed size per argument slot
-			maxArgs := 32      // MAX_ARGS
-
-			if len(raw) >= cmdlineBase+argLen {
-				end := cmdlineBase + cmdlineLen
-				if end > len(raw) {
-					end = len(raw)
-				}
-				cmdlineBytes := raw[cmdlineBase:end]
-
-				// extract args from fixed-size slots and join with spaces
-				var args []string
-				for i := 0; i < maxArgs; i++ {
-					slotStart := i * argLen
-					slotEnd := slotStart + argLen
-					if slotEnd > len(cmdlineBytes) {
-						break
-					}
-					slot := cmdlineBytes[slotStart:slotEnd]
-					// find null terminator in slot
-					if nullIdx := bytes.IndexByte(slot, 0); nullIdx > 0 {
-						args = append(args, string(slot[:nullIdx]))
-					} else if nullIdx < 0 && len(slot) > 0 {
-						// no null found, use whole slot
-						args = append(args, string(slot))
-					}
-					// nullIdx == 0 means empty slot, stop
-					if len(slot) == 0 || slot[0] == 0 {
-						break
-					}
-				}
-				cmdline = strings.Join(args, " ")
-			}
-
+			// extract cmdline and filename from raw sample
+			cmdline, filename = parseCmdlineAndFilename(raw)
 			// Fallback: if cmdline or filename are empty (e.g. connect/accept events), try to fetch from /proc
 			// Use cache to avoid excessive I/O
 			var pInfo procInfo
@@ -509,14 +586,16 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 					}
 				}
 
-				// determine parent process name when available
+				// determine parent process name and pid when available
 				parentName := ""
+				var parentPid uint32
 				if ppid, err := getParentPid(tgid); err == nil && ppid != 0 {
 					parentName = parentExeBasename(ppid)
+					parentPid = ppid
 				}
 
 				// Update cache
-				pInfo = procInfo{name: newFilename, cmdline: newCmdline, parent: parentName}
+				pInfo = procInfo{name: newFilename, cmdline: newCmdline, parent: parentName, parentPid: parentPid}
 				procCache[tgid] = pInfo
 
 				// Simple eviction if cache grows too large
@@ -557,73 +636,9 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				evtCode = "login"
 			}
 
-			// attempt to parse optional network fields appended after cmdline
-			// layout in C: after cmdline (offset 300 + 4096 == 4396) =>
-			// family(2), sport(2), dport(2), __pad(2), saddr(4), daddr(4), saddr6(16), daddr6(16)
-			var netInfo map[string]interface{}
+			// parse network info from raw sample
 			netBase := 4396 // 300 (cmdline offset) + 4096 (cmdline size)
-
-			// read family if present
-			if len(raw) >= netBase+2 {
-				family := binary.LittleEndian.Uint16(raw[netBase : netBase+2])
-				if family != 0 {
-					netInfo = map[string]interface{}{"network.family": int(family)}
-
-					// try to read ports (sport,dport) if present
-					if len(raw) >= netBase+6 {
-						sport := binary.LittleEndian.Uint16(raw[netBase+2 : netBase+4])
-						dport := binary.LittleEndian.Uint16(raw[netBase+4 : netBase+6])
-						if sport != 0 {
-							netInfo["network.sport"] = int(sport)
-						}
-						if dport != 0 {
-							netInfo["network.dport"] = int(dport)
-						}
-					}
-
-					// ipv4 addresses (saddr,daddr) - skip 2 bytes padding after dport
-					if len(raw) >= netBase+16 {
-						saddrBytes := raw[netBase+8 : netBase+12]
-						daddrBytes := raw[netBase+12 : netBase+16]
-						saddrStr := fmt.Sprintf("%d.%d.%d.%d", saddrBytes[0], saddrBytes[1], saddrBytes[2], saddrBytes[3])
-						daddrStr := fmt.Sprintf("%d.%d.%d.%d", daddrBytes[0], daddrBytes[1], daddrBytes[2], daddrBytes[3])
-						// only add non-zero addresses
-						if !(saddrBytes[0] == 0 && saddrBytes[1] == 0 && saddrBytes[2] == 0 && saddrBytes[3] == 0) {
-							netInfo["network.saddr"] = saddrStr
-						}
-						if !(daddrBytes[0] == 0 && daddrBytes[1] == 0 && daddrBytes[2] == 0 && daddrBytes[3] == 0) {
-							netInfo["network.daddr"] = daddrStr
-						}
-					}
-
-					// ipv6 addresses (offset 16 for saddr6, 32 for daddr6)
-					if len(raw) >= netBase+48 {
-						saddr6 := raw[netBase+16 : netBase+32]
-						daddr6 := raw[netBase+32 : netBase+48]
-						// ignore all-zero ipv6
-						zero6 := true
-						for i := 0; i < 16; i++ {
-							if saddr6[i] != 0 {
-								zero6 = false
-								break
-							}
-						}
-						if !zero6 {
-							netInfo["network.saddr6"] = net.IP(saddr6).String()
-						}
-						zero6 = true
-						for i := 0; i < 16; i++ {
-							if daddr6[i] != 0 {
-								zero6 = false
-								break
-							}
-						}
-						if !zero6 {
-							netInfo["network.daddr6"] = net.IP(daddr6).String()
-						}
-					}
-				}
-			}
+			netInfo := parseNetworkInfo(raw, netBase)
 
 			// compute gulp.event_code as fnv hash of evtAction
 			h := fnv.New32a()
@@ -690,71 +705,127 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 				}
 			}
 
-			// apply dst port and src ip include/exclude filters
-			// destination port include: when configured, only allow matching dports
-			if len(cfg.DstPortInclude) > 0 {
-				if dpv, ok := e["network.dport"]; ok {
-					if dport, ok2 := dpv.(int); ok2 {
-						if !intSliceContains(cfg.DstPortInclude, dport) {
-							dbg("excluding event because dst port not in include list: %d", dport)
-							continue
-						}
-					} else {
-						// can't interpret dport -> skip
-						dbg("excluding event because dst port not present or invalid for include check")
-						continue
-					}
-				} else {
-					// no dport present -> does not match include
-					dbg("excluding event because dst port missing and include list configured")
-					continue
-				}
-			}
-
-			// destination port exclude: if configured and matches, skip
-			if len(cfg.DstPortExclude) > 0 {
-				if dpv, ok := e["network.dport"]; ok {
-					if dport, ok2 := dpv.(int); ok2 {
-						if intSliceContains(cfg.DstPortExclude, dport) {
-							dbg("excluding event because dst port in exclude list: %d", dport)
+			// apply port and ip filters only for connection events and only when the
+			// corresponding fields are present in the event. this avoids excluding
+			// unrelated event types (eg: proc_exec) and avoids applying include/exclude
+			// checks when the bpf sample didn't populate the field.
+			if evtCode == "conn_inbound" || evtCode == "conn_outbound" {
+				// destination port include: apply only if dport present
+				if len(cfg.DstPortInclude) > 0 {
+					if dpv, ok := e["network.dport"]; ok {
+						if dport, ok2 := dpv.(int); ok2 {
+							if !intSliceContains(cfg.DstPortInclude, dport) {
+								dbg("excluding event because dst port not in include list: %d", dport)
+								continue
+							}
+						} else {
+							// present but invalid -> exclude
+							dbg("excluding event because dst port present but invalid for include check")
 							continue
 						}
 					}
+					// if dport not present, do not apply include filter
 				}
-			}
 
-			// source ip include/exclude: check both ipv4 and ipv6 fields
-			if len(cfg.SrcIPInclude) > 0 {
-				matched := false
-				if s, ok := e["network.saddr"].(string); ok {
-					if ipListMatches(cfg.SrcIPInclude, s) {
-						matched = true
+				// destination port exclude: apply only if dport present
+				if len(cfg.DstPortExclude) > 0 {
+					if dpv, ok := e["network.dport"]; ok {
+						if dport, ok2 := dpv.(int); ok2 {
+							if intSliceContains(cfg.DstPortExclude, dport) {
+								dbg("excluding event because dst port in exclude list: %d", dport)
+								continue
+							}
+						}
 					}
 				}
-				if !matched {
-					if s6, ok := e["network.saddr6"].(string); ok {
-						if ipListMatches(cfg.SrcIPInclude, s6) {
+
+				// determine presence of src/dst ip fields
+				hasSrc := false
+				if _, ok := e["network.saddr"].(string); ok {
+					hasSrc = true
+				}
+				if _, ok := e["network.saddr6"].(string); ok {
+					hasSrc = true
+				}
+				hasDst := false
+				if _, ok := e["network.daddr"].(string); ok {
+					hasDst = true
+				}
+				if _, ok := e["network.daddr6"].(string); ok {
+					hasDst = true
+				}
+
+				// source ip include: apply only if at least one src ip is present
+				if len(cfg.SrcIPInclude) > 0 && hasSrc {
+					matched := false
+					if s, ok := e["network.saddr"].(string); ok {
+						if ipListMatches(cfg.SrcIPInclude, s) {
 							matched = true
 						}
 					}
-				}
-				if !matched {
-					dbg("excluding event because src ip not in include list")
-					continue
-				}
-			}
-
-			if len(cfg.SrcIPExclude) > 0 {
-				if s, ok := e["network.saddr"].(string); ok {
-					if ipListMatches(cfg.SrcIPExclude, s) {
-						dbg("excluding event because src ip in exclude list: %s", s)
+					if !matched {
+						if s6, ok := e["network.saddr6"].(string); ok {
+							if ipListMatches(cfg.SrcIPInclude, s6) {
+								matched = true
+							}
+						}
+					}
+					if !matched {
+						dbg("excluding event because src ip not in include list")
 						continue
 					}
 				}
-				if s6, ok := e["network.saddr6"].(string); ok {
-					if ipListMatches(cfg.SrcIPExclude, s6) {
-						dbg("excluding event because src ip in exclude list: %s", s6)
+
+				// source ip exclude: apply only when at least one src ip present
+				if len(cfg.SrcIPExclude) > 0 && hasSrc {
+					if s, ok := e["network.saddr"].(string); ok {
+						if ipListMatches(cfg.SrcIPExclude, s) {
+							dbg("excluding event because src ip in exclude list: %s", s)
+							continue
+						}
+					}
+					if s6, ok := e["network.saddr6"].(string); ok {
+						if ipListMatches(cfg.SrcIPExclude, s6) {
+							dbg("excluding event because src ip in exclude list: %s", s6)
+							continue
+						}
+					}
+				}
+
+				// destination ip include: apply only if at least one dst ip is present
+				if len(cfg.DstIPInclude) > 0 && hasDst {
+					matched := false
+					if d, ok := e["network.daddr"].(string); ok {
+						if ipListMatches(cfg.DstIPInclude, d) {
+							matched = true
+						}
+					}
+					if !matched {
+						if d6, ok := e["network.daddr6"].(string); ok {
+							if ipListMatches(cfg.DstIPInclude, d6) {
+								matched = true
+							}
+						}
+					}
+					if !matched {
+						dbg("excluding event because dst ip not in include list")
 						continue
+					}
+				}
+
+				// destination ip exclude: apply only when at least one dst ip present
+				if len(cfg.DstIPExclude) > 0 && hasDst {
+					if d, ok := e["network.daddr"].(string); ok {
+						if ipListMatches(cfg.DstIPExclude, d) {
+							dbg("excluding event because dst ip in exclude list: %s", d)
+							continue
+						}
+					}
+					if d6, ok := e["network.daddr6"].(string); ok {
+						if ipListMatches(cfg.DstIPExclude, d6) {
+							dbg("excluding event because dst ip in exclude list: %s", d6)
+							continue
+						}
 					}
 				}
 			}
@@ -763,17 +834,20 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			var ppid uint32
 			var parentName string
 			if evtCode == "proc_exec" {
-				tmpPpid, err := getParentPid(tgid)
-				if err == nil && tmpPpid != 0 {
-					// parent name may be cached in pInfo.parent; fallback to exe basename
-					ppid = tmpPpid
+				// prefer cached parent pid/name to avoid extra /proc lookup
+				if pInfo.parentPid != 0 {
+					ppid = pInfo.parentPid
 					parentName = pInfo.parent
-					if parentName == "" {
-						parentName = parentExeBasename(ppid)
-					}
-					// attach parent fields to event
 					e["process.parent.pid"] = int(ppid)
 					e["process.parent.name"] = parentName
+				} else {
+					// fallback: try to read parent pid once
+					if tmpPpid, err := getParentPid(tgid); err == nil && tmpPpid != 0 {
+						ppid = tmpPpid
+						parentName = parentExeBasename(ppid)
+						e["process.parent.pid"] = int(ppid)
+						e["process.parent.name"] = parentName
+					}
 				}
 			}
 

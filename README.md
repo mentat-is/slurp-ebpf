@@ -1,8 +1,14 @@
 # slurp-ebpf
 
-slurp-ebpf is a small agent that reads kernel events via an eBPF program, buffers them in user-space and forwards them to the [gulp](https://github.com/mentat-is/gulp) `/ws_ingest_raw` websocket endpoint. 
+slurp-ebpf is a small agent that reads kernel events via an eBPF program, buffers them in user-space and forwards them to the [gulp](https://github.com/mentat-is/gulp) `/ws_ingest_raw` websocket endpoint.
 
 The agent batches events and sends them either when the buffer reaches a configured maximum size (`max_chunk_size`) or periodically (every 15 seconds), whichever comes first.
+
+## Scope
+
+this is meant to be used during a running incident response or red team engagement to capture process execution and network connection events in realtime with minimal setup, to pinpoint suspicious activity as it happens and then analyze it in gulp.
+
+**it is not intended to be a full-featured long-term monitoring agent.**
 
 ## Architecture
 
@@ -98,6 +104,3 @@ an [example commented configuration file is provided](./slurp_cfg_template.json)
 # run the agent (requires root), also enable debug logging
 sudo ./slurp-ebpf --debug
 ```
-
-the agent will authenticate to the configured Gulp server, connect over WebSocket, attach the requested eBPF hooks and start sending event chunks. press `Ctrl-C` to stop — the agent will send a final chunk before exiting.
-

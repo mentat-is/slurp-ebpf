@@ -36,6 +36,12 @@ type Config struct {
 	// src_ip_exclude: when non-empty, exclude events whose source
 	// ip matches one of these strings (supports ipv4 and ipv6)
 	SrcIPExclude []string `json:"src_ip_exclude,omitempty"`
+	// dst_ip_include: when non-empty, only include events whose destination
+	// ip matches one of these strings (supports ipv4 and ipv6)
+	DstIPInclude []string `json:"dst_ip_include,omitempty"`
+	// dst_ip_exclude: when non-empty, exclude events whose destination
+	// ip matches one of these strings (supports ipv4 and ipv6)
+	DstIPExclude []string `json:"dst_ip_exclude,omitempty"`
 }
 
 // GulpConfig contains credentials and URI for Gulp.
@@ -65,6 +71,8 @@ func createDefaultConfig(path string) error {
 		DstPortExclude: []int{},
 		SrcIPInclude:   []string{},
 		SrcIPExclude:   []string{},
+		DstIPInclude:   []string{},
+		DstIPExclude:   []string{},
 	}
 	b, err := json.MarshalIndent(defaultCfg, "", "  ")
 	if err != nil {
