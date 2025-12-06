@@ -24,6 +24,18 @@ type Config struct {
 	// process_parent_exclude: list of patterns to exclude events when the parent
 	// process executable matches (wildcards supported)
 	ProcessParentExclude []string `json:"process_parent_exclude,omitempty"`
+	// dst_port_include: when non-empty, only include events whose destination
+	// port matches one of these numeric ports
+	DstPortInclude []int `json:"dst_port_include,omitempty"`
+	// dst_port_exclude: when non-empty, exclude events whose destination
+	// port matches one of these numeric ports
+	DstPortExclude []int `json:"dst_port_exclude,omitempty"`
+	// src_ip_include: when non-empty, only include events whose source
+	// ip matches one of these strings (supports ipv4 and ipv6)
+	SrcIPInclude []string `json:"src_ip_include,omitempty"`
+	// src_ip_exclude: when non-empty, exclude events whose source
+	// ip matches one of these strings (supports ipv4 and ipv6)
+	SrcIPExclude []string `json:"src_ip_exclude,omitempty"`
 }
 
 // GulpConfig contains credentials and URI for Gulp.
@@ -49,6 +61,10 @@ func createDefaultConfig(path string) error {
 		},
 		MaxChunkSize: 1000,
 		Hooks:        []string{"proc_exec", "conn_outbound", "conn_inbound"},
+		DstPortInclude: []int{},
+		DstPortExclude: []int{},
+		SrcIPInclude:   []string{},
+		SrcIPExclude:   []string{},
 	}
 	b, err := json.MarshalIndent(defaultCfg, "", "  ")
 	if err != nil {

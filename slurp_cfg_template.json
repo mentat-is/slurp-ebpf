@@ -25,4 +25,13 @@
   "process_parent_exclude": [],
   // list of patterns to include events by "process.name", supports wildcards. if empty, no inclusion filtering is performed
   "process_include": []
+  ,
+  // list of numeric destination ports to include. if empty, no dst-port inclusion filtering is performed
+  "dst_port_include": [],
+  // list of numeric destination ports to exclude. if empty, no dst-port exclusion is performed
+  "dst_port_exclude": [],
+  // list of source ip addresses (ipv4 or ipv6) to include. if empty, no src-ip inclusion filtering is performed
+  "src_ip_include": [],
+  // list of source ip addresses (ipv4 or ipv6) to exclude. if empty, no src-ip exclusion is performed
+  "src_ip_exclude": []
 }

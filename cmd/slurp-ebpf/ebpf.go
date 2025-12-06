@@ -78,6 +78,45 @@ func shouldExcludeProcess(executable string, patterns []string) bool {
 	return false
 }
 
+// intSliceContains returns true if v is present in the slice.
+func intSliceContains(a []int, v int) bool {
+	for _, x := range a {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// ipListMatches checks whether the given ipStr matches any ip in the list.
+// entries and ipStr are parsed with net.ParseIP and compared using Equal.
+func ipListMatches(list []string, ipStr string) bool {
+	if ipStr == "" {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, candidate := range list {
+		if candidate == "" {
+			continue
+		}
+		cip := net.ParseIP(candidate)
+		if cip == nil {
+			// compare raw string fallback
+			if candidate == ipStr {
+				return true
+			}
+			continue
+		}
+		if cip.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // getParentPid reads /proc/<pid>/status and returns the parent pid (PPid).
 func getParentPid(pid uint32) (uint32, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
@@ -648,6 +687,75 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			if netInfo != nil {
 				for k, v := range netInfo {
 					e[k] = v
+				}
+			}
+
+			// apply dst port and src ip include/exclude filters
+			// destination port include: when configured, only allow matching dports
+			if len(cfg.DstPortInclude) > 0 {
+				if dpv, ok := e["network.dport"]; ok {
+					if dport, ok2 := dpv.(int); ok2 {
+						if !intSliceContains(cfg.DstPortInclude, dport) {
+							dbg("excluding event because dst port not in include list: %d", dport)
+							continue
+						}
+					} else {
+						// can't interpret dport -> skip
+						dbg("excluding event because dst port not present or invalid for include check")
+						continue
+					}
+				} else {
+					// no dport present -> does not match include
+					dbg("excluding event because dst port missing and include list configured")
+					continue
+				}
+			}
+
+			// destination port exclude: if configured and matches, skip
+			if len(cfg.DstPortExclude) > 0 {
+				if dpv, ok := e["network.dport"]; ok {
+					if dport, ok2 := dpv.(int); ok2 {
+						if intSliceContains(cfg.DstPortExclude, dport) {
+							dbg("excluding event because dst port in exclude list: %d", dport)
+							continue
+						}
+					}
+				}
+			}
+
+			// source ip include/exclude: check both ipv4 and ipv6 fields
+			if len(cfg.SrcIPInclude) > 0 {
+				matched := false
+				if s, ok := e["network.saddr"].(string); ok {
+					if ipListMatches(cfg.SrcIPInclude, s) {
+						matched = true
+					}
+				}
+				if !matched {
+					if s6, ok := e["network.saddr6"].(string); ok {
+						if ipListMatches(cfg.SrcIPInclude, s6) {
+							matched = true
+						}
+					}
+				}
+				if !matched {
+					dbg("excluding event because src ip not in include list")
+					continue
+				}
+			}
+
+			if len(cfg.SrcIPExclude) > 0 {
+				if s, ok := e["network.saddr"].(string); ok {
+					if ipListMatches(cfg.SrcIPExclude, s) {
+						dbg("excluding event because src ip in exclude list: %s", s)
+						continue
+					}
+				}
+				if s6, ok := e["network.saddr6"].(string); ok {
+					if ipListMatches(cfg.SrcIPExclude, s6) {
+						dbg("excluding event because src ip in exclude list: %s", s6)
+						continue
+					}
 				}
 			}
 
