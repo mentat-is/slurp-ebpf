@@ -472,6 +472,9 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 	// use configured max chunk size as capacity for buffered events
 	chunk := make([]Event, 0, cfg.MaxChunkSize)
 
+	// address resolver with caching (renew after 8192 entries)
+	resolver := NewAddrResolver(8192)
+
 	// simple cache for process info to avoid hitting /proc for every event
 	type procInfo struct {
 		name      string
@@ -852,6 +855,31 @@ func ebpfEventReader(ctx context.Context, bpfPath string, ws *WSClient, cfg *Con
 			}
 
 			// compute _id as sha256 hash of the event content
+			// if configured, attempt to resolve ip addresses and attach a single
+			// resolved name per direction: `network.saddr_resolved` and
+			// `network.daddr_resolved`. prefer the v4 field if present, else v6.
+			if cfg != nil && cfg.ResolveAddresses {
+				// source address: prefer network.saddr, fallback to network.saddr6
+				if s, ok := e["network.saddr"].(string); ok && s != "" {
+					if r := resolver.Resolve(s); r != s {
+						e["network.saddr_resolved"] = r
+					}
+				} else if s6, ok := e["network.saddr6"].(string); ok && s6 != "" {
+					if r := resolver.Resolve(s6); r != s6 {
+						e["network.saddr_resolved"] = r
+					}
+				}
+				// dest address: prefer network.daddr, fallback to network.daddr6
+				if d, ok := e["network.daddr"].(string); ok && d != "" {
+					if r := resolver.Resolve(d); r != d {
+						e["network.daddr_resolved"] = r
+					}
+				} else if d6, ok := e["network.daddr6"].(string); ok && d6 != "" {
+					if r := resolver.Resolve(d6); r != d6 {
+						e["network.daddr_resolved"] = r
+					}
+				}
+			}
 			eventBytes, _ := json.Marshal(e)
 			idHash := sha256.Sum256(eventBytes)
 			e["_id"] = hex.EncodeToString(idHash[:])

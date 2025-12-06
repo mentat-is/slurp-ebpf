@@ -17,6 +17,10 @@
   },
   // maximum chunk size for data ingestion (data is buffered then flushed every 15 seconds or when this size is reached)  
   "max_chunk_size": 1000,
+  // when true, attempt to resolve ip addresses into hostnames and attach
+  // resolved names to events as `network.*_resolved`. resolution uses a
+  // small cache to avoid repeated DNS lookups.
+  "resolve_addresses": false,
   // the hooks to be installed, supported hooks are "proc_exec" (process execution), "conn_outbound" (outbound connections), "conn_inbound" (inbound connections), "login" (login events). if empty, all hooks are installed
   "hooks": [],
   // list of patterns to exclude events by "process.name", supports wildcards. if empty, no exclusion is performed

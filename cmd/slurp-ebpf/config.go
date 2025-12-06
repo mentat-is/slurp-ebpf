@@ -15,6 +15,9 @@ type Config struct {
 	Gulp GulpConfig `json:"gulp"`
 	// max_chunk_size: maximum number of events sent in a single websocket packet
 	MaxChunkSize int      `json:"max_chunk_size"`
+	// resolve_addresses: when true, attempt to resolve ip addresses found in
+	// events to hostnames and attach resolved names to the event payload.
+	ResolveAddresses bool `json:"resolve_addresses,omitempty"`
 	Hooks        []string `json:"hooks"`
 	// process_exclude: list of patterns to exclude events by process.executable (wildcards supported)
 	ProcessExclude []string `json:"process_exclude,omitempty"`
@@ -65,6 +68,7 @@ func createDefaultConfig(path string) error {
 			Password:    "admin",
 			OperationID: "test_operation",
 		},
+		ResolveAddresses: false,
 		MaxChunkSize: 1000,
 		Hooks:        []string{"proc_exec", "conn_outbound", "conn_inbound"},
 		DstPortInclude: []int{},
